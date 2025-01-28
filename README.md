@@ -3,7 +3,7 @@
 A simple CLI type todo app. Written in C++ for linux systems. This tool provides a simple CLI interface to help manage daily tasks in the terminal. Future features may include:
 - Integrated cross-platform push notifications (including mobile).
 - More sophisticated categorization features.
-- Timers and chron jobs associated with tasks.
+- Timers and cron jobs associated with tasks.
 - AI LLM-agent integration for automatic task execution, or task creation.
 
 ### Dependencies and Target System
@@ -51,7 +51,6 @@ Refer to the [Dependencies Installation](#dependencies-installation) section bel
 | **UP/DOWN**     | Navigate through the file list                 |
 | **ENTER**       | Toggle the `assume-unchanged` state of a file  |
 | **TAB**         | Switch between "Current" and "Completed"       |
-| **Q**           | Quit the application                           |
 | **C**           | Complete a task                               |
 | **D**           | Delete a task                                 |
 | **N**           | Add a new task                                |

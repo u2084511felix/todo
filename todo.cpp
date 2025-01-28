@@ -10,6 +10,24 @@
 #include <algorithm> // for potential string trimming, find_if, etc.
 #include <ncurses.h>
 
+#include <filesystem>
+
+#include <cstdlib> // for system calls like getenv
+
+#include <sys/stat.h> // for mkdir
+
+#include <unistd.h>   // for access()
+
+namespace fs = std::filesystem;
+
+// Constants for the resource directory and file names
+const std::string resourceDir = std::string(std::getenv("HOME")) + "/todo/";
+const std::string currentFile = resourceDir + "current.txt";
+const std::string completedFile = resourceDir + "completed.txt";
+
+
+
+
 // We'll store the current and completed tasks in vectors:
 static std::vector<std::string> currentTasks;
 static std::vector<std::string> currentDates;
@@ -53,7 +71,7 @@ static std::string ncursesGetString(WINDOW* win, int startY, int startX, int max
         if (ch == '\n' || ch == '\r') {
             // Enter pressed
             break;
-        } else if (ch == 'q' || ch == 27) {
+        } else if (ch == 27) {
             // q pressed, treat as cancel -> return empty string
             result.clear();
             break;
@@ -582,7 +600,52 @@ static void gotoItem(int itemNum) {
     }
 }
 
+
+
+// Function to check and ensure the resource directory and files exist
+void ensureResourcesExist() {
+    // Check if the resource directory exists
+    if (!fs::exists(resourceDir)) {
+        std::cout << "Creating resource directory: " << resourceDir << std::endl;
+        fs::create_directories(resourceDir); // Create the directory
+    }
+
+    // Check and create the resource files if they don't exist
+    if (!fs::exists(currentFile)) {
+        std::cout << "Creating default resource file: " << currentFile << std::endl;
+        std::ofstream file(currentFile);
+        file << ""; // Initialize as empty
+    }
+
+    if (!fs::exists(completedFile)) {
+        std::cout << "Creating default resource file: " << completedFile << std::endl;
+        std::ofstream file(completedFile);
+        file << ""; // Initialize as empty
+    }
+}
+
+// Function to check if the program has write access to the directory
+bool hasWriteAccess(const std::string& path) {
+    if (access(path.c_str(), W_OK) == 0) {
+        return true;
+    } else {
+        std::cerr << "Write access denied for path: " << path << std::endl;
+        return false;
+    }
+}
+
+
 int main() {
+
+    // Ensure resource directory and files exist
+    ensureResourcesExist();
+
+    // Verify write access to the directory
+    if (!hasWriteAccess(resourceDir)) {
+        std::cerr << "Cannot write to resource directory: " << resourceDir << std::endl;
+        return 1;
+    }
+
     initscr();
     cbreak();
     noecho();
@@ -606,8 +669,9 @@ int main() {
     listWin = newwin(listHeight, listWidth, listStartY, listStartX);
     keypad(listWin, true);
 
-    loadTasks("current.txt", currentTasks, currentDates, currentCategories);
-    loadTasks("completed.txt", completedTasks, completedDates, completedCategories);
+    // Load tasks using absolute paths
+    loadTasks(currentFile, currentTasks, currentDates, currentCategories);
+    loadTasks(completedFile, completedTasks, completedDates, completedCategories);
 
     selectedIndex = 0;
 
@@ -619,6 +683,14 @@ int main() {
         bool needRedraw = false;
 
         switch (ch) {
+            case 'q':
+                // Save tasks using absolute paths
+                saveTasks(currentFile, currentTasks, currentDates, currentCategories);
+                saveTasks(completedFile, completedTasks, completedDates, completedCategories);
+                delwin(listWin);
+                endwin();
+                return 0;
+
             case KEY_UP:
                 if (selectedIndex > 0) {
                     selectedIndex--;
@@ -791,13 +863,6 @@ int main() {
                 needRedraw = true;
                 break;
 
-            case 'q': 
-                saveTasks("current.txt", currentTasks, currentDates, currentCategories);
-                saveTasks("completed.txt", completedTasks, completedDates, completedCategories);
-                delwin(listWin);
-                endwin();
-                return 0;
-
 
             default:
                 break;
@@ -813,4 +878,3 @@ int main() {
     endwin();
     return 0;
 }
-
