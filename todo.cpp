@@ -2,130 +2,159 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#include <ctime>
-#include <cctype>
-#include <cstdlib>
-#include <cstring>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 #include <set>
+#include <cctype>    // needed for isspace
+#include <algorithm> // for potential string trimming, find_if, etc.
 #include <ncurses.h>
 
-using namespace std;
-
-
-// testing gitstream
-
-// We can keep maximums for demonstration purposes, but now we are mainly relying on vectors.
-static const int MAX_TASKS = 1000;
-static const int MAX_TASK_LENGTH = 1024;
-
 // We'll store the current and completed tasks in vectors:
-vector<string> currentTasks;
-vector<string> currentDates;
-vector<string> currentCategories;
+static std::vector<std::string> currentTasks;
+static std::vector<std::string> currentDates;
+static std::vector<std::string> currentCategories;
 
-vector<string> completedTasks;
-vector<string> completedDates;
-vector<string> completedCategories;
+static std::vector<std::string> completedTasks;
+static std::vector<std::string> completedDates;
+static std::vector<std::string> completedCategories;
 
-int selectedIndex = 0;
-int viewMode = 0;  // 0 = current, 1 = completed
+static int selectedIndex = 0;
+static int viewMode = 0;  // 0 = current, 1 = completed
 
 // This category filter determines which items we display.
 // "All" means no filter; otherwise, show only tasks with matching category.
-string activeFilterCategory = "All";
+static std::string activeFilterCategory = "All";
 
-WINDOW* listWin;
+static WINDOW* listWin = nullptr;
 
 // Forward declarations
-void drawUI();
-void addTaskOverlay();
-void addCategoryOverlay(int taskIndex, bool forCompleted);
-void listCategoriesOverlay();
+static void drawUI();
+static void addTaskOverlay();
+static void addCategoryOverlay(int taskIndex, bool forCompleted);
+static void listCategoriesOverlay();
+static void completeTask();
+static void deleteTask();
+static void gotoItem(int itemNum);
 
-/**
- * Load tasks from a file into the provided vectors.
- * Expects each line in the format:  taskText|date|category
- * (Category can be empty.)
- */
-void loadTasks(const string& file,
-               vector<string>& tasks,
-               vector<string>& dates,
-               vector<string>& categories)
-{
-    ifstream fin(file);
-    if (!fin) {
-        return;  // If file doesn't exist or can't be opened, just return
-    }
+// Helper to read user input in a more C++-style way.
+static std::string ncursesGetString(WINDOW* win, int startY, int startX, int maxLen = 1024) {
+    std::string result;
+    int ch = 0;
+    wmove(win, startY, startX);
+    wrefresh(win);
 
-    string line;
+    // Enable cursor for input
+    curs_set(1);
+
     while (true) {
-        if (!std::getline(fin, line)) {
-            break;  // no more lines
-        }
+        ch = wgetch(win);
 
-        // Split by '|' up to 3 parts: task, date, category
-        // We'll do a simple approach using find and substr.
-        size_t firstSep = line.find('|');
-        if (firstSep == string::npos) {
+        if (ch == '\n' || ch == '\r') {
+            // Enter pressed
+            break;
+        } else if (ch == 'q' || ch == 27) {
+            // q pressed, treat as cancel -> return empty string
+            result.clear();
+            break;
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
+            if (!result.empty()) {
+                result.pop_back();
+                // Move cursor left, overwrite char with space, move cursor left again
+                int y, x;
+                getyx(win, y, x);
+                if (x > startX) {
+                    mvwaddch(win, y, x-1, ' ');
+                    wmove(win, y, x-1);
+                }
+            }
+        } else if (ch == KEY_LEFT || ch == KEY_RIGHT || ch == KEY_UP || ch == KEY_DOWN) {
+            // ignore arrow keys here
             continue;
+        } else if (ch >= 32 && ch < 127) {
+            // Basic printable ASCII range
+            if ((int)result.size() < maxLen) {
+                result.push_back(static_cast<char>(ch));
+                waddch(win, ch);
+            }
         }
-        size_t secondSep = line.find('|', firstSep + 1);
-
-        string task = line.substr(0, firstSep);
-        string date;
-        string cat;
-
-        if (secondSep == string::npos) {
-            // Then we only have task|date
-            date = line.substr(firstSep + 1);
-            cat = "";
-        } else {
-            date = line.substr(firstSep + 1, secondSep - (firstSep + 1));
-            cat = line.substr(secondSep + 1);
-        }
-
-        // Clean trailing newlines
-        if (!date.empty() && date.back() == '\n') {
-            date.pop_back();
-        }
-        if (!cat.empty() && cat.back() == '\n') {
-            cat.pop_back();
-        }
-
-        tasks.push_back(task);
-        dates.push_back(date);
-        categories.push_back(cat);
+        wrefresh(win);
     }
 
-    fin.close();
+    curs_set(0); // hide cursor again
+    return result;
 }
 
-/**
- * Save tasks into a file from the provided vectors.
- * Format: task|date|category
- */
-void saveTasks(const string& file,
-               const vector<string>& tasks,
-               const vector<string>& dates,
-               const vector<string>& categories)
-{
-    ofstream fout(file);
+// A small helper to split a string by delimiter, up to 3 parts (task|date|cat).
+static void splitTaskLine(const std::string& line,
+                          std::string& task,
+                          std::string& date,
+                          std::string& cat) {
+    // Find first separator
+    std::size_t firstSep = line.find('|');
+    if (firstSep == std::string::npos) {
+        // no valid data
+        task.clear();
+        date.clear();
+        cat.clear();
+        return;
+    }
+
+    std::size_t secondSep = line.find('|', firstSep + 1);
+
+    task = line.substr(0, firstSep);
+    if (secondSep == std::string::npos) {
+        // Then we only have task|date
+        date = line.substr(firstSep + 1);
+        cat = "";
+    } else {
+        date = line.substr(firstSep + 1, secondSep - (firstSep + 1));
+        cat = line.substr(secondSep + 1);
+    }
+}
+
+// Load tasks from file. Format: task|date|cat
+static void loadTasks(const std::string& file,
+                      std::vector<std::string>& tasks,
+                      std::vector<std::string>& dates,
+                      std::vector<std::string>& categories) {
+    std::ifstream fin(file);
+    if (!fin) {
+        return; // file didn't open, no tasks loaded
+    }
+
+    std::string line;
+    while (std::getline(fin, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        std::string task, date, cat;
+        splitTaskLine(line, task, date, cat);
+        if (!task.empty()) {
+            tasks.push_back(task);
+            dates.push_back(date);
+            categories.push_back(cat);
+        }
+    }
+}
+
+// Save tasks to file. Format: task|date|category
+static void saveTasks(const std::string& file,
+                      const std::vector<std::string>& tasks,
+                      const std::vector<std::string>& dates,
+                      const std::vector<std::string>& categories) {
+    std::ofstream fout(file);
     if (!fout) {
         return;
     }
 
-    for (size_t i = 0; i < tasks.size(); i++) {
+    for (std::size_t i = 0; i < tasks.size(); i++) {
         fout << tasks[i] << "|" << dates[i] << "|" << categories[i] << "\n";
     }
-
-    fout.close();
 }
 
-/**
- * Draw wrapped text in the specified window.
- * Returns the number of lines printed.
- */
-int drawWrappedText(WINDOW* win, int startY, int startX, int width, const string& text) {
+// Helper to draw text in a wrapped manner inside a curses window.
+static int drawWrappedText(WINDOW* win, int startY, int startX, int width, const std::string& text) {
     if (text.empty()) {
         mvwprintw(win, startY, startX, "%s", "");
         return 1;
@@ -139,35 +168,30 @@ int drawWrappedText(WINDOW* win, int startY, int startX, int width, const string
         int end = pos + width;
         if (end > len) end = len;
 
-        // Try not to break words
+        // Try not to break words.
         if (end < len) {
-            // Move backwards until we find a space or reach pos
             int tmp = end;
-            while (tmp > pos && !isspace(static_cast<unsigned char>(text[tmp]))) {
+            while (tmp > pos && !std::isspace(static_cast<unsigned char>(text[tmp]))) {
                 tmp--;
             }
             if (tmp == pos) {
-                // No space found, force split
+                // no space found, force the split
                 end = pos + width;
             } else {
                 end = tmp;
             }
         }
 
-        // Extract the substring
         int substrLen = end - pos;
         if (substrLen > width) {
             substrLen = width;
         }
-        string buffer = text.substr(pos, substrLen);
-
-        // Print the line
+        std::string buffer = text.substr(pos, substrLen);
         mvwprintw(win, startY + lineCount, startX, "%s", buffer.c_str());
 
-        // Move to the next segment
+        // move to the next segment
         pos = end;
-        // Skip any spaces
-        while (pos < len && isspace(static_cast<unsigned char>(text[pos]))) {
+        while (pos < len && std::isspace(static_cast<unsigned char>(text[pos]))) {
             pos++;
         }
         lineCount++;
@@ -176,43 +200,38 @@ int drawWrappedText(WINDOW* win, int startY, int startX, int width, const string
     return (lineCount > 0) ? lineCount : 1;
 }
 
-/**
- * Draw the user interface, including headers and the task list.
- * Now we filter by activeFilterCategory (if not "All").
- */
-void drawUI() {
+static void drawUI() {
     // Draw header on stdscr
-    attron(COLOR_PAIR(1));
+    wattron(stdscr, COLOR_PAIR(1));
     mvprintw(1, 2, "CLI TODO APP");
-    mvprintw(2, 2, "Current Tasks: %lu | Completed Tasks: %lu",
+    mvprintw(2, 2, "Current Tasks: %zu | Completed Tasks: %zu",
              currentTasks.size(), completedTasks.size());
     mvhline(3, 2, ACS_HLINE, COLS - 4);
-    mvprintw(4, 2, "Keys: c=complete, d=delete, n=add, s=set category, #:filter categories, Tab=switch file, ESC=save+exit");
+    mvprintw(4, 2, "Keys: c=complete, d=delete, n=add, s=set category, #:filter categories, Tab=switch file, q=save+exit");
     mvprintw(5, 2, "Nav: Up/Down, PgUp/PgDn, Home/End, Goto ':<num>'");
     mvprintw(6, 2, "Category Filter: %s", activeFilterCategory.c_str());
-    attroff(COLOR_PAIR(1));
+    wattroff(stdscr, COLOR_PAIR(1));
 
     // Determine column names based on view mode
     const char* colnames = (viewMode == 0) ? " Current Tasks " : " Completed Tasks ";
     const char* colcat   = " Category ";
     const char* coldates = (viewMode == 0) ? " Added on " : " Completed on ";
 
-    // Clear and redraw the list window
     werase(listWin);
     box(listWin, 0, 0);
     mvwprintw(listWin, 0, 2, " # ");
     mvwprintw(listWin, 0, 6, "%s", colnames);
-    // We'll put Category a bit to the right from the tasks, let's say near the far right
-    // Adjust your layout as desired
-    int dateColumnPos = getmaxx(listWin) - 14;     // where date is displayed
-    int categoryColumnPos = getmaxx(listWin) - 26; // some spacing for category
+
+    int dateColumnPos = getmaxx(listWin) - 14;     // date is displayed here
+    int categoryColumnPos = getmaxx(listWin) - 26; // spacing for category
     mvwprintw(listWin, 0, categoryColumnPos, "%s", colcat);
     mvwprintw(listWin, 0, dateColumnPos, "%s", coldates);
 
-    // Select the appropriate vectors
-    const vector<string>* tasks;
-    const vector<string>* dates;
-    const vector<string>* categories;
+    // pick the vectors
+    const std::vector<std::string>* tasks;
+    const std::vector<std::string>* dates;
+    const std::vector<std::string>* categories;
+
     if (viewMode == 0) {
         tasks = &currentTasks;
         dates = &currentDates;
@@ -223,10 +242,10 @@ void drawUI() {
         categories = &completedCategories;
     }
 
-    // Build a list of indices that match our category filter
-    vector<int> filteredIndices;
+    // build filtered list
+    std::vector<int> filteredIndices;
     filteredIndices.reserve(tasks->size());
-    for (int i = 0; i < (int)tasks->size(); i++) {
+    for (int i = 0; i < static_cast<int>(tasks->size()); i++) {
         if (activeFilterCategory == "All" ||
             (*categories)[i] == activeFilterCategory)
         {
@@ -234,26 +253,21 @@ void drawUI() {
         }
     }
 
-    // Ensure selectedIndex is in range of filtered items
+    // clamp selectedIndex
     if (!filteredIndices.empty()) {
-        if (selectedIndex >= (int)filteredIndices.size()) {
-            selectedIndex = (int)filteredIndices.size() - 1;
+        if (selectedIndex >= static_cast<int>(filteredIndices.size())) {
+            selectedIndex = static_cast<int>(filteredIndices.size()) - 1;
         }
         if (selectedIndex < 0) {
             selectedIndex = 0;
         }
     } else {
-        // No items in the filter, set selectedIndex to 0
         selectedIndex = 0;
     }
 
-    int taskCount = (int)filteredIndices.size();
-
-    // Calculate visible lines and scroll offset
+    int taskCount = static_cast<int>(filteredIndices.size());
     int visibleLines = getmaxy(listWin) - 2;
     int scrollOffset = 0;
-    // If selectedIndex is too far down, we scroll so that selected item is visible.
-    // A simple approach:
     if (selectedIndex >= visibleLines) {
         scrollOffset = selectedIndex - (visibleLines - 1);
     }
@@ -265,25 +279,23 @@ void drawUI() {
         }
 
         int realIndex = filteredIndices[idx];
-
         if (idx == selectedIndex) {
             wattron(listWin, COLOR_PAIR(2));
         } else {
             wattron(listWin, COLOR_PAIR(1));
         }
 
-        // Print item number
         mvwprintw(listWin, currentY, 2, "%-3d", realIndex + 1);
 
-        // Print category
+        // category
         mvwprintw(listWin, currentY, categoryColumnPos, "%-12s",
                   (*categories)[realIndex].c_str());
 
-        // Print date (far right)
+        // date
         mvwprintw(listWin, currentY, dateColumnPos, "%s",
                   (*dates)[realIndex].c_str());
 
-        // Print wrapped task text
+        // task text
         int linesUsed = drawWrappedText(listWin, currentY, 6,
                                         categoryColumnPos - 7,
                                         (*tasks)[realIndex]);
@@ -297,16 +309,12 @@ void drawUI() {
         currentY += linesUsed;
     }
 
-    // Prepare windows for refreshing
     wnoutrefresh(stdscr);
     wnoutrefresh(listWin);
 }
 
-/**
- * Display an overlay window to add a new task.
- * After user enters a task, if not empty, we also prompt for category.
- */
-void addTaskOverlay() {
+// Overlay to add a new task.
+static void addTaskOverlay() {
     int overlayHeight = 7;
     int overlayWidth = COLS - 20;
     int overlayY = (LINES - overlayHeight) / 2;
@@ -318,34 +326,33 @@ void addTaskOverlay() {
     mvwprintw(overlayWin, 1, 2, "Enter new task:");
     wrefresh(overlayWin);
 
-    char input[MAX_TASK_LENGTH] = {0};
-    echo();
-    curs_set(1); // Show cursor for input
-    mvwgetnstr(overlayWin, 2, 2, input, MAX_TASK_LENGTH - 1);
-    noecho();
-    curs_set(0); // Hide cursor after input
+    // read user input with modern approach
+    std::string newTask = ncursesGetString(overlayWin, 2, 2, 1024);
 
-    // If the user actually typed something:
-    if (strlen(input) > 0 && currentTasks.size() < MAX_TASKS) {
-        currentTasks.push_back(string(input));
-        time_t now = time(nullptr);
-        char dateStr[20];
-        strftime(dateStr, 20, "%Y-%m-%d", localtime(&now));
-        currentDates.push_back(dateStr);
-        // Default no category
+    if (!newTask.empty()) {
+        // create item
+        currentTasks.push_back(newTask);
+
+        // get date/time in modern c++ way
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_t = std::chrono::system_clock::to_time_t(now);
+        std::tm localTm = *std::localtime(&now_t);
+        std::ostringstream oss;
+        oss << std::put_time(&localTm, "%Y-%m-%d");
+        currentDates.push_back(oss.str());
+
+        // default no category
         currentCategories.push_back("");
 
-        // Prompt for a category right away
-        addCategoryOverlay((int)currentTasks.size() - 1, false);
+        // overlay to set category immediately
+        addCategoryOverlay(static_cast<int>(currentTasks.size()) - 1, false);
     }
 
     delwin(overlayWin);
 }
 
-/**
- * Overlay to set (or update) the category of a specific item.
- */
-void addCategoryOverlay(int taskIndex, bool forCompleted) {
+// Overlay to set or update category for an item.
+static void addCategoryOverlay(int taskIndex, bool forCompleted) {
     int overlayHeight = 7;
     int overlayWidth = COLS - 20;
     int overlayY = (LINES - overlayHeight) / 2;
@@ -355,8 +362,7 @@ void addCategoryOverlay(int taskIndex, bool forCompleted) {
     wbkgd(overlayWin, COLOR_PAIR(3));
     box(overlayWin, 0, 0);
 
-    // If forCompleted = false => current tasks, else completed tasks
-    string existingCat;
+    std::string existingCat;
     if (!forCompleted) {
         existingCat = currentCategories[taskIndex];
         mvwprintw(overlayWin, 1, 2, "Enter category for current item #%d:", taskIndex + 1);
@@ -364,59 +370,50 @@ void addCategoryOverlay(int taskIndex, bool forCompleted) {
         existingCat = completedCategories[taskIndex];
         mvwprintw(overlayWin, 1, 2, "Enter category for completed item #%d:", taskIndex + 1);
     }
+    wmove(overlayWin, 2, 2);
     wrefresh(overlayWin);
 
-    char input[MAX_TASK_LENGTH] = {0};
-    // Pre-fill with existing category
-    strncpy(input, existingCat.c_str(), MAX_TASK_LENGTH - 1);
+    // let's prefill. We'll just print it out, then let the user edit if desired.
+    waddstr(overlayWin, existingCat.c_str());
 
-    echo();
-    curs_set(1);
-    mvwgetnstr(overlayWin, 2, 2, input, MAX_TASK_LENGTH - 1);
-    noecho();
-    curs_set(0);
+    // now let's do input in place. We'll do a simple approach: read fresh.
+    std::string newCat = ncursesGetString(overlayWin, 2, 2, 1024);
 
-    // Store the new category (or empty if user cleared it)
     if (!forCompleted) {
-        currentCategories[taskIndex] = string(input);
+        if (!newCat.empty() || existingCat.empty()) {
+            currentCategories[taskIndex] = newCat;
+        }
     } else {
-        completedCategories[taskIndex] = string(input);
+        if (!newCat.empty() || existingCat.empty()) {
+            completedCategories[taskIndex] = newCat;
+        }
     }
 
     delwin(overlayWin);
 }
 
-/**
- * Overlay listing unique categories, plus "All" at the top.
- * User picks one, which sets activeFilterCategory.
- */
-void listCategoriesOverlay() {
-    // Gather categories from whichever view we are in
-    const vector<string>* cats;
-    if (viewMode == 0) {
-        cats = &currentCategories;
-    } else {
-        cats = &completedCategories;
-    }
-
-    // Build a set of unique categories
-    set<string> uniqueCats;
-    for (auto &c : *cats) {
+// Overlay listing categories.
+static void listCategoriesOverlay() {
+    // gather categories from whichever mode
+    const std::vector<std::string>* cats = (viewMode == 0) ? &currentCategories : &completedCategories;
+    std::set<std::string> uniqueCats;
+    for (const auto &c : *cats) {
         if (!c.empty()) {
             uniqueCats.insert(c);
         }
     }
 
-    // We'll store them in a vector so we can index them
-    vector<string> catList;
-    // Put "All" on top
+    // put them in a vector for indexing
+    std::vector<std::string> catList;
     catList.push_back("All");
-    for (auto &c : uniqueCats) {
+    for (const auto &c : uniqueCats) {
         catList.push_back(c);
     }
 
-    int overlayHeight = 5 + (int)catList.size();
-    if (overlayHeight > LINES - 2) overlayHeight = LINES - 2; // clamp
+    int overlayHeight = 5 + static_cast<int>(catList.size());
+    if (overlayHeight > LINES - 2) {
+        overlayHeight = LINES - 2;
+    }
     int overlayWidth = 40;
     int overlayY = (LINES - overlayHeight) / 2;
     int overlayX = (COLS - overlayWidth) / 2;
@@ -428,14 +425,15 @@ void listCategoriesOverlay() {
     mvwprintw(overlayWin, 1, 2, "Select a category to filter:");
     wrefresh(overlayWin);
 
-    // We'll do a simple selection with up/down, enter to confirm, ESC to cancel
-    int catSelected = 0; // index in catList
-    keypad(overlayWin, TRUE);
+    int catSelected = 0;
+    keypad(overlayWin, true);
 
     while (true) {
-        // Draw the category list
-        for (int i = 0; i < (int)catList.size(); i++) {
-            if (i+3 >= overlayHeight - 1) break; // no more space
+        // draw the category list
+        for (int i = 0; i < static_cast<int>(catList.size()); i++) {
+            if (i + 3 >= overlayHeight - 1) {
+                break;
+            }
             if (i == catSelected) {
                 wattron(overlayWin, COLOR_PAIR(2));
             } else {
@@ -456,14 +454,13 @@ void listCategoriesOverlay() {
                 catSelected--;
             }
         } else if (ch == KEY_DOWN) {
-            if (catSelected < (int)catList.size() - 1) {
+            if (catSelected < static_cast<int>(catList.size()) - 1) {
                 catSelected++;
             }
-        } else if (ch == 27) {
-            // ESC = cancel, do not change the filter
+        } else if (ch == 'q' || ch == 27) {
+            // q = cancel
             break;
-        } else if (ch == '\n') {
-            // pick the category
+        } else if (ch == '\n' || ch == '\r') {
             activeFilterCategory = catList[catSelected];
             break;
         }
@@ -472,144 +469,111 @@ void listCategoriesOverlay() {
     delwin(overlayWin);
 }
 
-/**
- * Mark the selected current task as completed.
- * We use the *filtered index* to locate real index.
- */
-void completeTask() {
-    // In viewMode 0, we can complete an item
+static void completeTask() {
+    // only in viewMode 0
     if (viewMode == 0 && !currentTasks.empty()) {
-        // Build filtered index
-        vector<int> filteredIndices;
-        for (int i = 0; i < (int)currentTasks.size(); i++) {
-            if (activeFilterCategory == "All" ||
-                currentCategories[i] == activeFilterCategory)
-            {
+        // build filtered indices
+        std::vector<int> filteredIndices;
+        filteredIndices.reserve(currentTasks.size());
+        for (int i = 0; i < static_cast<int>(currentTasks.size()); i++) {
+            if (activeFilterCategory == "All" || currentCategories[i] == activeFilterCategory) {
                 filteredIndices.push_back(i);
             }
         }
         if (filteredIndices.empty()) return;
-        if (selectedIndex >= (int)filteredIndices.size()) return;
+        if (selectedIndex >= static_cast<int>(filteredIndices.size())) return;
 
         int realIndex = filteredIndices[selectedIndex];
 
-        if (completedTasks.size() < MAX_TASKS) {
-            // Move item to completed
-            completedTasks.push_back(currentTasks[realIndex]);
-            completedDates.push_back(currentDates[realIndex]);
-            completedCategories.push_back(currentCategories[realIndex]);
-        }
-        // Erase from current
+        // move item to completed
+        completedTasks.push_back(currentTasks[realIndex]);
+        completedDates.push_back(currentDates[realIndex]);
+        completedCategories.push_back(currentCategories[realIndex]);
+
+        // remove from current
         currentTasks.erase(currentTasks.begin() + realIndex);
         currentDates.erase(currentDates.begin() + realIndex);
         currentCategories.erase(currentCategories.begin() + realIndex);
 
-        // Adjust selectedIndex
-        if (selectedIndex >= (int)filteredIndices.size()) {
-            selectedIndex = (int)filteredIndices.size() - 1;
+        if (selectedIndex >= static_cast<int>(filteredIndices.size())) {
+            selectedIndex = static_cast<int>(filteredIndices.size()) - 1;
         }
         if (selectedIndex < 0) selectedIndex = 0;
     }
 }
 
-/**
- * Delete the selected task from the current or completed list.
- */
-void deleteTask() {
+static void deleteTask() {
     if (viewMode == 0) {
-        // Build filtered index
-        vector<int> filteredIndices;
-        for (int i = 0; i < (int)currentTasks.size(); i++) {
-            if (activeFilterCategory == "All" ||
-                currentCategories[i] == activeFilterCategory)
-            {
+        if (currentTasks.empty()) return;
+        std::vector<int> filteredIndices;
+        filteredIndices.reserve(currentTasks.size());
+        for (int i = 0; i < static_cast<int>(currentTasks.size()); i++) {
+            if (activeFilterCategory == "All" || currentCategories[i] == activeFilterCategory) {
                 filteredIndices.push_back(i);
             }
         }
         if (filteredIndices.empty()) return;
-        if (selectedIndex >= (int)filteredIndices.size()) return;
-        int realIndex = filteredIndices[selectedIndex];
+        if (selectedIndex >= static_cast<int>(filteredIndices.size())) return;
 
+        int realIndex = filteredIndices[selectedIndex];
         currentTasks.erase(currentTasks.begin() + realIndex);
         currentDates.erase(currentDates.begin() + realIndex);
         currentCategories.erase(currentCategories.begin() + realIndex);
 
-        if (selectedIndex >= (int)filteredIndices.size()) {
-            selectedIndex = (int)filteredIndices.size() - 1;
+        if (selectedIndex >= static_cast<int>(filteredIndices.size())) {
+            selectedIndex = static_cast<int>(filteredIndices.size()) - 1;
         }
         if (selectedIndex < 0) selectedIndex = 0;
     } else {
-        vector<int> filteredIndices;
-        for (int i = 0; i < (int)completedTasks.size(); i++) {
-            if (activeFilterCategory == "All" ||
-                completedCategories[i] == activeFilterCategory)
-            {
+        if (completedTasks.empty()) return;
+        std::vector<int> filteredIndices;
+        filteredIndices.reserve(completedTasks.size());
+        for (int i = 0; i < static_cast<int>(completedTasks.size()); i++) {
+            if (activeFilterCategory == "All" || completedCategories[i] == activeFilterCategory) {
                 filteredIndices.push_back(i);
             }
         }
         if (filteredIndices.empty()) return;
-        if (selectedIndex >= (int)filteredIndices.size()) return;
-        int realIndex = filteredIndices[selectedIndex];
+        if (selectedIndex >= static_cast<int>(filteredIndices.size())) return;
 
+        int realIndex = filteredIndices[selectedIndex];
         completedTasks.erase(completedTasks.begin() + realIndex);
         completedDates.erase(completedDates.begin() + realIndex);
         completedCategories.erase(completedCategories.begin() + realIndex);
 
-        if (selectedIndex >= (int)filteredIndices.size()) {
-            selectedIndex = (int)filteredIndices.size() - 1;
+        if (selectedIndex >= static_cast<int>(filteredIndices.size())) {
+            selectedIndex = static_cast<int>(filteredIndices.size()) - 1;
         }
         if (selectedIndex < 0) selectedIndex = 0;
     }
 }
 
-/**
- * Jump to a specific item number in the *unfiltered* list. 
- * For convenience, let's adapt it to go to that item in the *full* list,
- * then see if it passes the filter. If it doesn't, the user won't see it.
- */
-void gotoItem(int itemNum) {
-    // In practice, you might want to align this with the filtered list approach.
-    // But for simplicity, we'll just set selectedIndex so it lines up with
-    // that item in unfiltered space, ignoring filter. Then the next draw
-    // might shift you around if that item is not in the filter.
-    // 
-    // A robust approach: build the filtered list, find which filtered index
-    // corresponds to itemNum - 1 in real index. 
-    // We'll do the robust approach:
-    itemNum--; // make 0-based
+static void gotoItem(int itemNum) {
+    // itemNum is 1-based, let's make it 0-based
+    itemNum -= 1;
     if (viewMode == 0) {
-        if (itemNum < 0 || itemNum >= (int)currentTasks.size()) return;
-
-        // Build filteredIndices
-        vector<int> filteredIndices;
-        for (int i = 0; i < (int)currentTasks.size(); i++) {
-            if (activeFilterCategory == "All" ||
-                currentCategories[i] == activeFilterCategory)
-            {
+        if (itemNum < 0 || itemNum >= static_cast<int>(currentTasks.size())) return;
+        std::vector<int> filteredIndices;
+        for (int i = 0; i < static_cast<int>(currentTasks.size()); i++) {
+            if (activeFilterCategory == "All" || currentCategories[i] == activeFilterCategory) {
                 filteredIndices.push_back(i);
             }
         }
-        // Find which index in filteredIndices corresponds to itemNum
-        for (int fi = 0; fi < (int)filteredIndices.size(); fi++) {
+        for (int fi = 0; fi < static_cast<int>(filteredIndices.size()); fi++) {
             if (filteredIndices[fi] == itemNum) {
                 selectedIndex = fi;
                 return;
             }
         }
-        // If not found, do nothing
     } else {
-        if (itemNum < 0 || itemNum >= (int)completedTasks.size()) return;
-
-        vector<int> filteredIndices;
-        for (int i = 0; i < (int)completedTasks.size(); i++) {
-            if (activeFilterCategory == "All" ||
-                completedCategories[i] == activeFilterCategory)
-            {
+        if (itemNum < 0 || itemNum >= static_cast<int>(completedTasks.size())) return;
+        std::vector<int> filteredIndices;
+        for (int i = 0; i < static_cast<int>(completedTasks.size()); i++) {
+            if (activeFilterCategory == "All" || completedCategories[i] == activeFilterCategory) {
                 filteredIndices.push_back(i);
             }
         }
-        // Find which index in filteredIndices corresponds to itemNum
-        for (int fi = 0; fi < (int)filteredIndices.size(); fi++) {
+        for (int fi = 0; fi < static_cast<int>(filteredIndices.size()); fi++) {
             if (filteredIndices[fi] == itemNum) {
                 selectedIndex = fi;
                 return;
@@ -619,63 +583,42 @@ void gotoItem(int itemNum) {
 }
 
 int main() {
-    // Initialize ncurses
     initscr();
-    cbreak();              // Pass keystrokes immediately
-    noecho();             // Do not echo input characters
-    keypad(stdscr, TRUE);  // Enable special keys
-    curs_set(0);          // Hide cursor
+    cbreak();
+    noecho();
+    keypad(stdscr, true);
+    curs_set(0);
 
-    // Initialize color pairs
-    if (has_colors() == FALSE) {
+    if (!has_colors()) {
         endwin();
-        cout << "Your terminal does not support color" << endl;
-        exit(1);
+        std::cerr << "Your terminal does not support color." << std::endl;
+        return 1;
     }
     start_color();
-    init_pair(1, COLOR_GREEN, COLOR_BLACK);  // Regular text
-    init_pair(2, COLOR_BLACK, COLOR_WHITE);  // Highlighted text
-    init_pair(3, COLOR_BLUE, COLOR_BLACK);   // Overlay background
+    init_pair(1, COLOR_GREEN, COLOR_BLACK);
+    init_pair(2, COLOR_BLACK, COLOR_WHITE);
+    init_pair(3, COLOR_BLUE, COLOR_BLACK);
 
-    // Create the list window
-    int listStartY = 8, listStartX = 2;
+    int listStartY = 8;
+    int listStartX = 2;
     int listHeight = LINES - listStartY - 2;
-    int listWidth  = COLS - 4;
+    int listWidth = COLS - 4;
     listWin = newwin(listHeight, listWidth, listStartY, listStartX);
-    keypad(listWin, TRUE); // Enable special keys for list window
+    keypad(listWin, true);
 
-    // Load tasks from files
-    loadTasks("current.txt",   currentTasks,   currentDates,   currentCategories);
+    loadTasks("current.txt", currentTasks, currentDates, currentCategories);
     loadTasks("completed.txt", completedTasks, completedDates, completedCategories);
 
-    // Ensure selectedIndex is within bounds
     selectedIndex = 0;
 
-    // Initial draw
     drawUI();
-    doupdate(); // Batch refresh to minimize flicker
+    doupdate();
 
-    int ch;
     while (true) {
-        ch = wgetch(stdscr); // Get input from stdscr
-
+        int ch = wgetch(stdscr);
         bool needRedraw = false;
 
         switch (ch) {
-            case 27: // ESC key -> exit
-                // Save tasks before exiting
-                saveTasks("current.txt",
-                          currentTasks,
-                          currentDates,
-                          currentCategories);
-                saveTasks("completed.txt",
-                          completedTasks,
-                          completedDates,
-                          completedCategories);
-                delwin(listWin);
-                endwin();
-                return 0;
-
             case KEY_UP:
                 if (selectedIndex > 0) {
                     selectedIndex--;
@@ -684,31 +627,26 @@ int main() {
                 break;
 
             case KEY_DOWN: {
-                // We need to see how many items are in the filtered list
-                vector<int> filteredIndices;
+                // find how many in filtered list
+                std::vector<int> filteredIndices;
                 if (viewMode == 0) {
-                    for (int i = 0; i < (int)currentTasks.size(); i++) {
-                        if (activeFilterCategory == "All" ||
-                            currentCategories[i] == activeFilterCategory)
-                        {
+                    for (int i = 0; i < static_cast<int>(currentTasks.size()); i++) {
+                        if (activeFilterCategory == "All" || currentCategories[i] == activeFilterCategory) {
                             filteredIndices.push_back(i);
                         }
                     }
                 } else {
-                    for (int i = 0; i < (int)completedTasks.size(); i++) {
-                        if (activeFilterCategory == "All" ||
-                            completedCategories[i] == activeFilterCategory)
-                        {
+                    for (int i = 0; i < static_cast<int>(completedTasks.size()); i++) {
+                        if (activeFilterCategory == "All" || completedCategories[i] == activeFilterCategory) {
                             filteredIndices.push_back(i);
                         }
                     }
                 }
-                if (selectedIndex < (int)filteredIndices.size() - 1) {
+                if (selectedIndex < static_cast<int>(filteredIndices.size()) - 1) {
                     selectedIndex++;
                     needRedraw = true;
                 }
-                break;
-            }
+            } break;
 
             case KEY_HOME:
                 if (selectedIndex != 0) {
@@ -718,33 +656,27 @@ int main() {
                 break;
 
             case KEY_END: {
-                // Figure out the size of the filtered list
-                vector<int> filteredIndices;
+                std::vector<int> filteredIndices;
                 if (viewMode == 0) {
-                    for (int i = 0; i < (int)currentTasks.size(); i++) {
-                        if (activeFilterCategory == "All" ||
-                            currentCategories[i] == activeFilterCategory)
-                        {
+                    for (int i = 0; i < static_cast<int>(currentTasks.size()); i++) {
+                        if (activeFilterCategory == "All" || currentCategories[i] == activeFilterCategory) {
                             filteredIndices.push_back(i);
                         }
                     }
                 } else {
-                    for (int i = 0; i < (int)completedTasks.size(); i++) {
-                        if (activeFilterCategory == "All" ||
-                            completedCategories[i] == activeFilterCategory)
-                        {
+                    for (int i = 0; i < static_cast<int>(completedTasks.size()); i++) {
+                        if (activeFilterCategory == "All" || completedCategories[i] == activeFilterCategory) {
                             filteredIndices.push_back(i);
                         }
                     }
                 }
                 if (!filteredIndices.empty()) {
-                    selectedIndex = (int)filteredIndices.size() - 1;
+                    selectedIndex = static_cast<int>(filteredIndices.size()) - 1;
                     needRedraw = true;
                 }
-                break;
-            }
+            } break;
 
-            case KEY_PPAGE: {
+            case KEY_PPAGE:
                 if (selectedIndex > 10) {
                     selectedIndex -= 10;
                 } else {
@@ -752,29 +684,23 @@ int main() {
                 }
                 needRedraw = true;
                 break;
-            }
 
             case KEY_NPAGE: {
-                // Check how many filtered items
-                vector<int> filteredIndices;
+                std::vector<int> filteredIndices;
                 if (viewMode == 0) {
-                    for (int i = 0; i < (int)currentTasks.size(); i++) {
-                        if (activeFilterCategory == "All" ||
-                            currentCategories[i] == activeFilterCategory)
-                        {
+                    for (int i = 0; i < static_cast<int>(currentTasks.size()); i++) {
+                        if (activeFilterCategory == "All" || currentCategories[i] == activeFilterCategory) {
                             filteredIndices.push_back(i);
                         }
                     }
                 } else {
-                    for (int i = 0; i < (int)completedTasks.size(); i++) {
-                        if (activeFilterCategory == "All" ||
-                            completedCategories[i] == activeFilterCategory)
-                        {
+                    for (int i = 0; i < static_cast<int>(completedTasks.size()); i++) {
+                        if (activeFilterCategory == "All" || completedCategories[i] == activeFilterCategory) {
                             filteredIndices.push_back(i);
                         }
                     }
                 }
-                int limit = (int)filteredIndices.size();
+                int limit = static_cast<int>(filteredIndices.size());
                 if (selectedIndex + 10 < limit) {
                     selectedIndex += 10;
                 } else {
@@ -782,8 +708,7 @@ int main() {
                     else selectedIndex = 0;
                 }
                 needRedraw = true;
-                break;
-            }
+            } break;
 
             case 'n':
                 addTaskOverlay();
@@ -801,29 +726,21 @@ int main() {
                 break;
 
             case 's': {
-                // Set category for selected item
-                // We need the real index from filtered list
-                vector<int> filteredIndices;
+                std::vector<int> filteredIndices;
                 if (viewMode == 0) {
-                    for (int i = 0; i < (int)currentTasks.size(); i++) {
-                        if (activeFilterCategory == "All" ||
-                            currentCategories[i] == activeFilterCategory)
-                        {
+                    for (int i = 0; i < static_cast<int>(currentTasks.size()); i++) {
+                        if (activeFilterCategory == "All" || currentCategories[i] == activeFilterCategory) {
                             filteredIndices.push_back(i);
                         }
                     }
                 } else {
-                    for (int i = 0; i < (int)completedTasks.size(); i++) {
-                        if (activeFilterCategory == "All" ||
-                            completedCategories[i] == activeFilterCategory)
-                        {
+                    for (int i = 0; i < static_cast<int>(completedTasks.size()); i++) {
+                        if (activeFilterCategory == "All" || completedCategories[i] == activeFilterCategory) {
                             filteredIndices.push_back(i);
                         }
                     }
                 }
-                if (!filteredIndices.empty() &&
-                    selectedIndex < (int)filteredIndices.size())
-                {
+                if (!filteredIndices.empty() && selectedIndex < static_cast<int>(filteredIndices.size())) {
                     int realIndex = filteredIndices[selectedIndex];
                     if (viewMode == 0) {
                         addCategoryOverlay(realIndex, false);
@@ -832,82 +749,68 @@ int main() {
                     }
                     needRedraw = true;
                 }
-                break;
-            }
+            } break;
 
             case '#':
-                // Open category filter overlay
                 listCategoriesOverlay();
                 needRedraw = true;
                 break;
 
             case ':': {
-                // Prompt for item number to go to
                 mvprintw(LINES - 1, 0, "Goto item (Enter to cancel): ");
                 clrtoeol();
                 wnoutrefresh(stdscr);
                 doupdate();
-
-                char lineInput[10] = {0};
-                int idx = 0;
-                int c2;
-
-                curs_set(1); // Show cursor
                 echo();
-                while ((c2 = wgetch(stdscr)) != '\n') {
-                    if (c2 == KEY_BACKSPACE || c2 == 127 || c2 == '\b') {
-                        if (idx > 0) {
-                            idx--;
-                            lineInput[idx] = '\0';
-                            mvprintw(LINES - 1, 0, "Goto item (Enter to cancel): %s ", lineInput);
-                            clrtoeol();
-                        }
-                    } else if (isdigit(c2) && idx < 9) {
-                        lineInput[idx++] = static_cast<char>(c2);
-                        lineInput[idx] = '\0';
-                        mvprintw(LINES - 1, 0, "Goto item (Enter to cancel): %s", lineInput);
-                        clrtoeol();
-                    }
-                    wnoutrefresh(stdscr);
-                    doupdate();
-                }
+                curs_set(1);
+
+                char buffer[16] = {0}; // Initialize buffer directly instead of using memset
+
+                wgetnstr(stdscr, buffer, 15);
                 noecho();
-                curs_set(0); // Hide cursor
+                curs_set(0);
 
-                if (lineInput[0] != '\0') {
-                    int itemNum = atoi(lineInput);
-                    gotoItem(itemNum);
-                    needRedraw = true;
+                std::string lineInput(buffer);
+                if (!lineInput.empty()) {
+                    try {
+                        int itemNum = std::stoi(lineInput);
+                        gotoItem(itemNum);
+                        needRedraw = true;
+                    } catch (...) {}
                 }
 
-                // Clear the prompt line
-                mvprintw(LINES - 1, 0, "                                        ");
+                mvprintw(LINES - 1, 0, "                                              ");
                 clrtoeol();
                 wnoutrefresh(stdscr);
                 doupdate();
-                break;
-            }
+            } break;            
 
-            case '\t': // Tab key to switch views
+            case '\t':
                 viewMode = !viewMode;
-                // Reset selectedIndex to 0 or within range
                 selectedIndex = 0;
                 needRedraw = true;
                 break;
+
+            case 'q': 
+                saveTasks("current.txt", currentTasks, currentDates, currentCategories);
+                saveTasks("completed.txt", completedTasks, completedDates, completedCategories);
+                delwin(listWin);
+                endwin();
+                return 0;
+
 
             default:
                 break;
         }
 
-        // Redraw UI if needed
         if (needRedraw) {
             drawUI();
             doupdate();
         }
     }
 
-    // Cleanup
     delwin(listWin);
     endwin();
     return 0;
 }
+
