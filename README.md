@@ -24,9 +24,9 @@ Refer to the [Dependencies Installation](#dependencies-installation) section bel
    ```
 
 2. 
-   a) Create a symbolic link to make the binary executable from anywhere (e.g., `/usr/local/bin`):
+   a) Run the setup script:
    ```bash
-   sudo ln -s $(pwd)/todo /usr/local/bin/todo
+   sudo ./setup.sh <user>
    ```
 
    or
