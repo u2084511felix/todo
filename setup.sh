@@ -58,21 +58,21 @@ echo "Reloading systemd daemon..."
 sudo systemctl daemon-reload
 
 echo "Making symlink from ${SERVICE_NAME} to ${BIN_DAEMON}..."
-if [[ "${BIN_DAEMON}" ]] then
+if [[ "${BIN_DAEMON}" ]]; then
   sudo rm "${BIN_DAEMON}"
 fi
 sudo ln "$(pwd)/${SERVICE_NAME}" "${BIN_DAEMON}"
 sudo chmod +x "${BIN_DAEMON}"
 
 echo "Making symlink from ${CLIENT_NAME} to ${BIN_CLIENT}..."
-if [[ "${BIN_CLIENT}" ]] then
+if [[ "${BIN_CLIENT}" ]]; then
   sudo rm "${BIN_CLIENT}"
 fi
 sudo ln "$(pwd)/${CLIENT_NAME}" "${BIN_CLIENT}"
 sudo chmod +x "${BIN_CLIENT}"
 
 # 2) Create the notifications directory
-if [[ ! -f "${DB_FILE}" ]] then
+if [[ ! -f "${DB_FILE}" ]]; then
   sudo touch "${DB_FILE}"
   # Optionally set ownership so that the daemon user can write to it
   sudo chown "${USERNAME}":"${USERNAME}" "${NOTIF_DIR}"

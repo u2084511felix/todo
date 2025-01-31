@@ -765,7 +765,7 @@ int main() {
         int ch = wgetch(stdscr);
         bool needRedraw = false;
         bool updated = false;
-
+        loadNotifications();
 
         switch (ch) {
             case 'q':
