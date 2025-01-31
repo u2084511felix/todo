@@ -128,12 +128,9 @@ static std::string ncursesGetString(WINDOW* win, int startY, int startX, int max
 }
 
 // Load notifications from NOTIFICATION_FILE
-std::vector<Notification> loadNotifications() {
+void loadNotifications() {
     std::vector<Notification> notifs;
     std::ifstream inFile(NOTIFICATION_FILE);
-    if (!inFile.is_open()) {
-        return notifs;
-    }
 
     std::string line;
     while (std::getline(inFile, line)) {
@@ -155,22 +152,19 @@ std::vector<Notification> loadNotifications() {
         notifs.push_back(n);
     }
     inFile.close();
-    return notifs;
+    notifications = notifs;
 }
 
 // Save notifications to NOTIFICATION_FILE
-bool saveNotifications() {
+void saveNotifications() {
     std::ofstream outFile(NOTIFICATION_FILE, std::ios::trunc);
-    if (!outFile.is_open()) {
-        return false;
-    }
+
     for (auto &n : notifications) {
         outFile << n.scheduledTime << ";"
                 << (n.triggered ? "1" : "0") << ";"
                 << n.message << "\n";
     }
     outFile.close();
-    return true;
 }
 
 // Load tasks from TODO_FILE
@@ -759,7 +753,7 @@ int main() {
     keypad(listWin, true);
 
     // Load notifications first
-    notifications = loadNotifications();
+    loadNotifications();
     allTasks = loadTasksFromFile();
     filterTasks(allTasks);
 
@@ -770,11 +764,14 @@ int main() {
     while (true) {
         int ch = wgetch(stdscr);
         bool needRedraw = false;
+        bool updated = false;
+
 
         switch (ch) {
             case 'q':
                 // Save all tasks + notifications
                 saveTasks();
+                loadNotifications();
                 saveNotifications();
                 delwin(listWin);
                 endwin();
@@ -851,7 +848,7 @@ int main() {
             } break;
 
             case 'r': {
-
+                
                 const std::vector<Task> &temp = (viewMode == 0) ? currentTasks : completedTasks;
                 std::vector<int> filteredIndices;
                 for (int i = 0; i < (int)temp.size(); i++) {
@@ -889,8 +886,6 @@ int main() {
                 }
                 notifications.push_back(new_reminder);
                 saveNotifications();
-                
-
             } 
                 needRedraw = true;
                 break;
