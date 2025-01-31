@@ -41,29 +41,45 @@ if [[ ! -f "./${CLIENT_NAME}" ]]; then
 fi
 
 
-echo "Stopping and disabling ${SERVICE_NAME} service..."
-sudo systemctl stop "${SERVICE_NAME}.service"
-sudo systemctl disable "${SERVICE_NAME}.service"
+if [[ ! "${NOTIF_DIR}" ]]; then
+  echo "Creating resources file in '${NOTIF_DIR}'."
+  sudo mkdir -p "${NOTIF_DIR}" 
+fi
+
+
+if [[ -f "${SYSTEMD_PATH}" ]]; then
+  echo "Stopping and disabling ${SERVICE_NAME} service..."
+  sudo systemctl stop "${SERVICE_NAME}.service"
+  sudo systemctl disable "${SERVICE_NAME}.service"
+fi
 
 # 4) Enable and start the service
 echo "Reloading systemd daemon..."
 sudo systemctl daemon-reload
 
-echo "Copying ${SERVICE_NAME} to ${BIN_DAEMON}..."
-sudo cp "./${SERVICE_NAME}" "${BIN_DAEMON}"
+echo "Making symlink from ${SERVICE_NAME} to ${BIN_DAEMON}..."
+if [[ "${BIN_DAEMON}" ]] then
+  sudo rm "${BIN_DAEMON}"
+fi
+sudo ln "$(pwd)/${SERVICE_NAME}" "${BIN_DAEMON}"
 sudo chmod +x "${BIN_DAEMON}"
 
-echo "Copying ${CLIENT_NAME} to ${BIN_CLIENT}..."
-sudo cp "./${CLIENT_NAME}" "${BIN_CLIENT}"
+echo "Making symlink from ${CLIENT_NAME} to ${BIN_CLIENT}..."
+if [[ "${BIN_CLIENT}" ]] then
+  sudo rm "${BIN_CLIENT}"
+fi
+sudo ln "$(pwd)/${CLIENT_NAME}" "${BIN_CLIENT}"
 sudo chmod +x "${BIN_CLIENT}"
 
 # 2) Create the notifications directory
-sudo mkdir -p "${NOTIF_DIR}"
-sudo touch "${DB_FILE}"
-# Optionally set ownership so that the daemon user can write to it
-sudo chown "${USERNAME}":"${USERNAME}" "${NOTIF_DIR}"
-sudo chown "${USERNAME}":"${USERNAME}" "${DB_FILE}"
-sudo chmod 664 "${DB_FILE}"
+if [[ ! -f "${DB_FILE}" ]] then
+  sudo touch "${DB_FILE}"
+  # Optionally set ownership so that the daemon user can write to it
+  sudo chown "${USERNAME}":"${USERNAME}" "${NOTIF_DIR}"
+  sudo chown "${USERNAME}":"${USERNAME}" "${DB_FILE}"
+  sudo chmod 664 "${DB_FILE}"
+fi
+
 
 # 3) Create the systemd service
 echo "Creating systemd service at ${SYSTEMD_PATH}..."
@@ -101,4 +117,4 @@ sudo systemctl start "${SERVICE_NAME}.service"
 
 echo "Installation complete!"
 echo "Check status: sudo systemctl status ${SERVICE_NAME}.service"
-echo "Use 'my_client' to schedule notifications."
+echo "Use 'todo' to add items and schedule notifications."
