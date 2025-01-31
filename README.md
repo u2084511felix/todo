@@ -33,7 +33,7 @@ Refer to the [Dependencies Installation](#dependencies-installation) section bel
 
    b) Compile the program yourself:
    ```bash
-   g++ -o todo todo.cpp -lncurses
+   g++ todo.cpp -o todo -lncurses                                                                                          
    ```
    Then do step 2(a).
 
