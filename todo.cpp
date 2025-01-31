@@ -7,6 +7,7 @@
 #include <sstream>
 #include <set>
 #include <cctype>
+#include <wchar.h>
 #include <algorithm>
 #include <ncurses.h>
 #include <ctime>
@@ -80,50 +81,59 @@ long long get_unix_timestamp() {
     return timestamp;
 }
 
-static std::string ncursesGetString(WINDOW* win, int startY, int startX, int maxLen = 1024) {
-    std::string result;
-    int ch = 0;
-    wmove(win, startY, startX);
-    wrefresh(win);
 
-    // Enable cursor for input
-    curs_set(1);
+static std::string ncursesGetString(WINDOW* win, int startY, int startX, int maxLen = 1024, std::string result = "") {
+    wchar_t ch;
+    int cursorPos = result.size();  // Track cursor position within string
+    wmove(win, startY, startX + cursorPos);
+    wrefresh(win);
+    curs_set(1);  // Show cursor
 
     while (true) {
-        ch = wgetch(win);
+        ch = getch();
 
         if (ch == '\n' || ch == '\r') {
-            // Enter pressed
+            // Enter pressed - return final string
             break;
         } else if (ch == 27) { 
-            // ESC pressed, treat as cancel -> return empty string
+            // ESC pressed - cancel edit
             result.clear();
             break;
         } else if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
-            if (!result.empty()) {
-                result.pop_back();
-                // Move cursor left, overwrite char with space, move cursor left again
-                int y, x;
-                getyx(win, y, x);
-                if (x > startX) {
-                    mvwaddch(win, y, x-1, ' ');
-                    wmove(win, y, x-1);
-                }
+            if (!result.empty() && cursorPos > 0) {
+                result.erase(cursorPos - 1, 1);  // Remove character at cursorPos - 1
+                cursorPos--;
+
+                // Redraw the string with shift effect
+                mvwprintw(win, startY, startX, "%s ", result.c_str());  // Clear extra char
+                wmove(win, startY, startX + cursorPos);
             }
-        } else if (ch == KEY_LEFT || ch == KEY_RIGHT || ch == KEY_UP || ch == KEY_DOWN) {
-            // ignore arrow keys for input
-            continue;
+        } else if (ch == KEY_LEFT) {
+            if (cursorPos > 0) {
+                cursorPos--;
+                wmove(win, startY, startX + cursorPos);
+            }
+        } else if (ch == KEY_RIGHT) {
+            if (cursorPos < (int)result.size()) {
+                cursorPos++;
+                wmove(win, startY, startX + cursorPos);
+            }
         } else if (ch >= 32 && ch < 127) {
-            // Basic printable ASCII range
+            // Insert character at cursor position instead of overwriting
             if ((int)result.size() < maxLen) {
-                result.push_back(static_cast<char>(ch));
-                waddch(win, ch);
+                result.insert(cursorPos, 1, static_cast<char>(ch));
+                cursorPos++;
+
+                // Redraw entire string to reflect the inserted char
+                mvwprintw(win, startY, startX, "%s ", result.c_str());  // Extra space to clear last char
+                wmove(win, startY, startX + cursorPos);
             }
         }
+
         wrefresh(win);
     }
 
-    curs_set(0); // hide cursor again
+    curs_set(0);  // Hide cursor again
     return result;
 }
 
@@ -412,7 +422,7 @@ static void drawListUI() {
 
         // The task text (wrapped)
         int linesUsed = drawWrappedText(listWin, currentY, 6,
-                                        categoryColumnPos - 7,
+                                        reminderColPos - 7,
                                         temp[realIndex].task);
 
         if (idx == selectedIndex) {
@@ -475,6 +485,25 @@ static void addTaskOverlay() {
     }
     delwin(overlayWin);
 }
+
+
+// Overlay to add a new task
+std::string editTaskOverlay(Task task) {
+    int overlayHeight = 7;
+    int overlayWidth = COLS - 20;
+    int overlayY = (LINES - overlayHeight) / 2;
+    int overlayX = (COLS - overlayWidth) / 2;
+    WINDOW* overlayWin = newwin(overlayHeight, overlayWidth, overlayY, overlayX);
+    wbkgd(overlayWin, COLOR_PAIR(3));
+    box(overlayWin, 0, 0);
+    mvwprintw(overlayWin, 1, 2, "Edit task:");
+    mvwprintw(overlayWin, 2, 2, "%s", task.task.c_str());
+    wrefresh(overlayWin);
+    std::string edit_task = ncursesGetString(overlayWin, 2, 2, 1024, task.task);
+    delwin(overlayWin);
+    return edit_task;
+}
+
 
 // Overlay to set/update category for an item
 static void addCategoryOverlay(int taskIndex, bool forCompleted) {
@@ -625,6 +654,52 @@ static void completeTask() {
     }
     if (selectedIndex < 0) selectedIndex = 0;
 }
+
+
+
+void editTask() {
+    const std::vector<Task>& temp = (viewMode == 0) ? currentTasks : completedTasks;
+    std::vector<int> filteredIndices;
+
+    for (int i = 0; i < (int)temp.size(); i++) {
+        if (activeFilterCategory == "All" || temp[i].category == activeFilterCategory) {
+            filteredIndices.push_back(i);
+        }
+    }
+
+    if (!filteredIndices.empty() && selectedIndex < (int)filteredIndices.size()) {
+        int realIndex = filteredIndices[selectedIndex];
+
+        std::string edited_task;
+        
+        if (viewMode == 0) {
+            // Edit current tasks
+            Task& updated = currentTasks[realIndex];  // Use reference to modify directly
+            edited_task = editTaskOverlay(updated);
+            updated.task = edited_task;  // Apply changes
+
+            // Update the corresponding task in allTasks
+            for (Task& task : allTasks) {
+                if (task.dates[0] == updated.dates[0]) {
+                    task.task = edited_task;
+                }
+            }
+        } else {
+            // Edit completed tasks
+            Task& updated = completedTasks[realIndex];  // Use reference to modify directly
+            edited_task = editTaskOverlay(updated);
+            updated.task = edited_task;  // Apply changes
+
+            // Update the corresponding task in allTasks
+            for (Task& task : allTasks) {
+                if (task.dates[0] == updated.dates[0]) {
+                    task.task = edited_task;
+                }
+            }
+        }
+    }
+}
+
 
 static void deleteTask() {
     // Decide which vector to remove from
@@ -892,7 +967,6 @@ int main() {
 
             case 'n':
                 addTaskOverlay();
-                // TODO: push updates to notifications array / file / and save;
                 needRedraw = true;
                 break;
 
@@ -945,6 +1019,11 @@ int main() {
 
             case '#':
                 listCategoriesOverlay();
+                needRedraw = true;
+                break;
+
+            case 'e':
+                editTask();
                 needRedraw = true;
                 break;
 
