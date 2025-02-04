@@ -8,6 +8,11 @@
 #include <cstdlib>    // for system()
 #include <ctime>      // for time()
 
+
+// TODO: inotify + epoll. Waits for file modification.
+
+//
+//
 // Path to the file storing scheduled notifications.
 // Make sure your service has permission to read/write this file.
 

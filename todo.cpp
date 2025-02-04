@@ -62,7 +62,7 @@ static void listCategoriesOverlay();
 static void completeTask();
 static void deleteTask();
 static void gotoItem(int itemNum);
-static Notification setReminderOverlay();
+static void setReminderOverlay();
 
 long long convertToSeconds(long long quantity, char unit) {
     switch (unit) {
@@ -314,7 +314,7 @@ std::vector<std::string> formatDate(const Task &task) {
 
     // If st == 0, might mean "no reminder set"
     if (st == 0) {
-        snprintf(bufReminder, sizeof(bufReminder), "NoRem");
+        snprintf(bufReminder, sizeof(bufReminder), " ");
     } else {
         std::strftime(bufReminder, sizeof(bufReminder), "%Y-%m-%d %H:%M", std::localtime(&tReminder));
     }
@@ -444,9 +444,9 @@ static void drawUI() {
     mvprintw(2, 2, "Current Tasks: %zu | Completed Tasks: %zu",
              currentTasks.size(), completedTasks.size());
     mvhline(3, 2, ACS_HLINE, COLS - 4);
-    mvprintw(4, 2, "Keys: c=complete, d=delete, n=add, s=category, r=reminder, #:filter, Tab=switch, q=save+exit");
+    mvprintw(4, 2, "Keys: c=complete, d=delete, n=add, s=category, r=reminder, e=edit, #:filter, Tab=switch, q=save+exit");
     mvprintw(5, 2, "Nav: Up/Down, PgUp/PgDn, Home/End, Goto ':<num>'");
-    mvprintw(6, 2, "Category Filter: %s", activeFilterCategory.c_str());
+    mvprintw(6, 2, "Category Filter: %s                 ", activeFilterCategory.c_str() );
     wattroff(stdscr, COLOR_PAIR(1));
 
     drawListUI();
@@ -529,9 +529,13 @@ static void addCategoryOverlay(int taskIndex, bool forCompleted) {
     waddstr(overlayWin, theTask.category.c_str());
     wrefresh(overlayWin);
 
-    std::string newCat = ncursesGetString(overlayWin, 2, 2, 1024);
+    std::string newCat = ncursesGetString(overlayWin, 2, 2, 1024, theTask.category);
     if (!newCat.empty()) {
+        if (newCat.size() >= 17) {
+            newCat.erase(newCat.size() - 17);  // Remove the last 17 characters safely
+        }
         theTask.category = newCat;
+
     }
     delwin(overlayWin);
 }
@@ -758,8 +762,43 @@ static void gotoItem(int itemNum) {
     }
 }
 
+
 // Overlay to set an initial reminder time
-Notification setReminderOverlay() {
+void addNotification(long long scheduled_time) {
+    if (viewMode != 0) return;  // only valid in current-view
+    if (currentTasks.empty()) return;
+
+    // Build filteredIndices
+    std::vector<int> filteredIndices;
+    for (int i = 0; i < (int)currentTasks.size(); i++) {
+        if (activeFilterCategory == "All" || currentTasks[i].category == activeFilterCategory) {
+            filteredIndices.push_back(i);
+        }
+    }
+
+    if (filteredIndices.empty()) return;
+    if (selectedIndex >= (int)filteredIndices.size()) return;
+
+    int realIndex = filteredIndices[selectedIndex];
+
+    Task t = currentTasks[realIndex];
+    t.notification.scheduledTime = scheduled_time;
+    t.notification.message = t.task;
+
+    for (int i = 0; i < allTasks.size(); i++) {
+        if (allTasks[i].dates[0] == t.dates[0]) {
+            allTasks[i] = t;
+            break;
+        }
+    }
+
+    currentTasks[realIndex] = t;
+    notifications.push_back(t.notification);
+};
+
+
+// Overlay to set an initial reminder time
+void setReminderOverlay() {
     int overlayHeight = 8;
     int overlayWidth = 60;
     int overlayY = (LINES - overlayHeight) / 2;
@@ -793,13 +832,8 @@ Notification setReminderOverlay() {
 
     long long scheduledTime = (long long)now + offsetSeconds;
 
-    Notification newNotif;
-    newNotif.scheduledTime = (offsetSeconds == 0 ? 0 : scheduledTime); // if user gave 0 or blank
-    newNotif.triggered = false;
-    newNotif.message = "Task reminder";
-
+    addNotification(scheduledTime);
     delwin(overlayWin);
-    return newNotif;
 }
 
 int main() {
@@ -839,9 +873,7 @@ int main() {
     while (true) {
         int ch = wgetch(stdscr);
         bool needRedraw = false;
-        bool updated = false;
         loadNotifications();
-
         switch (ch) {
             case 'q':
                 // Save all tasks + notifications
@@ -922,46 +954,9 @@ int main() {
                 needRedraw = true;
             } break;
 
-            case 'r': {
-                
-                const std::vector<Task> &temp = (viewMode == 0) ? currentTasks : completedTasks;
-                std::vector<int> filteredIndices;
-                for (int i = 0; i < (int)temp.size(); i++) {
-                    if (activeFilterCategory == "All" || temp[i].category == activeFilterCategory) {
-                        filteredIndices.push_back(i);
-                    }
-                }
-
-                Notification new_reminder = setReminderOverlay();
-                if (!filteredIndices.empty() && selectedIndex < (int)filteredIndices.size()) {
-                    int realIndex = filteredIndices[selectedIndex];
-                    // Also update allTasks so we don't lose the new category
-                    if (viewMode == 0) {
-               
-                        Task &updated = currentTasks[realIndex];
-                        for (auto &A : allTasks) {
-                            if (A.dates[0] == updated.dates[0] &&
-                                A.task == updated.task) {
-                                new_reminder.message = A.task;
-                                A.notification = new_reminder;
-                            }
-                        }
-
-                    } else {
-                        // completed
-                        Task &updated = completedTasks[realIndex];
-                        for (auto &A : allTasks) {
-                            if (A.dates[0] == updated.dates[0] &&
-                                A.task == updated.task) {
-                                new_reminder.message = A.task;
-                                A.notification = new_reminder;
-                            }
-                        }
-                    }
-                }
-                notifications.push_back(new_reminder);
+            case 'r': 
+                setReminderOverlay();
                 saveNotifications();
-            } 
                 needRedraw = true;
                 break;
 
