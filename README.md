@@ -55,6 +55,7 @@ Refer to the [Dependencies Installation](#dependencies-installation) section bel
 | **D**           | Delete a task                                 |
 | **N**           | Add a new task                                |
 | **S**           | Set a category                                |
+| **E**           | Edit a task                                   |
 | **#**           | Filter categories                             |
 | **PgUp/PgDn**   | Navigate by page                              |
 | **Home/End**    | Jump to the beginning or end of the list       |

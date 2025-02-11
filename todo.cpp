@@ -403,7 +403,7 @@ static void drawListUI() {
         if (idx == selectedIndex) {
             wattron(listWin, COLOR_PAIR(2));
         } else {
-            wattron(listWin, COLOR_PAIR(1));
+            wattron(listWin, COLOR_PAIR(3));
         }
 
         // Show the item number (1-based)
@@ -428,7 +428,7 @@ static void drawListUI() {
         if (idx == selectedIndex) {
             wattroff(listWin, COLOR_PAIR(2));
         } else {
-            wattroff(listWin, COLOR_PAIR(1));
+            wattroff(listWin, COLOR_PAIR(3));
         }
         currentY += linesUsed;
     }
@@ -439,7 +439,7 @@ static void drawListUI() {
 
 static void drawUI() {
     // Draw header on stdscr
-    wattron(stdscr, COLOR_PAIR(1));
+    wattron(stdscr, COLOR_PAIR(3));
     mvprintw(1, 2, "CLI TODO APP");
     mvprintw(2, 2, "Current Tasks: %zu | Completed Tasks: %zu",
              currentTasks.size(), completedTasks.size());
@@ -447,7 +447,7 @@ static void drawUI() {
     mvprintw(4, 2, "Keys: c=complete, d=delete, n=add, s=category, r=reminder, e=edit, #:filter, Tab=switch, q=save+exit");
     mvprintw(5, 2, "Nav: Up/Down, PgUp/PgDn, Home/End, Goto ':<num>'");
     mvprintw(6, 2, "Category Filter: %s                 ", activeFilterCategory.c_str() );
-    wattroff(stdscr, COLOR_PAIR(1));
+    wattroff(stdscr, COLOR_PAIR(3));
 
     drawListUI();
 }
