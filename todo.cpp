@@ -1,79 +1,40 @@
+// main.cpp
 #include <iostream>
-#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
+#include <set>
+#include <array>
 #include <chrono>
 #include <iomanip>
-#include <sstream>
-#include <set>
-#include <cctype>
-#include <wchar.h>
-#include <algorithm>
-#include <ncurses.h>
 #include <ctime>
-#include <filesystem>
 #include <cstdlib>
-#include <sys/stat.h>
-#include <unistd.h>
-
+#include <ncurses.h>
+#include <cctype>
 #include <cstring>
-namespace fs = std::filesystem;
+#include <filesystem>
+#include <unistd.h>
+#include <sqlite3.h>
 
-static const std::string NOTIFICATION_FILE = "/var/lib/todo/notifications.db";
-static const std::string TODO_FILE = "/var/lib/todo/todo.db";
-
-// Represents a single notification
-struct Notification {
-    long long scheduledTime;  // Unix epoch when the notification should fire
-    bool triggered;           // Has the notification been triggered already?
-    std::string message;      // The text of the notification
-};
-
-struct Task {
-    std::string task;
-    bool completed;
-    std::string category;
-    // We'll store exactly two timestamps:
-    //   dates[0] = creation time
-    //   dates[1] = completion time (if completed)
-    std::array<long long, 2> dates;
-    Notification notification; 
-};
-
-static std::vector<Notification> notifications;
-static std::vector<Task> allTasks;
-static std::vector<Task> currentTasks;
-static std::vector<Task> completedTasks;
-
+static const std::string DB_PATH = "/var/lib/todo/todosql.db";
 static int selectedIndex = 0;
 static int viewMode = 0;  // 0 = current, 1 = completed
-
-// This category filter determines which items we display.
-// "All" means no filter; otherwise, show only tasks with matching category.
 static std::string activeFilterCategory = "All";
 
 static WINDOW* listWin = nullptr;
 
-// Forward declarations
+// Forward declarations of UI functions
 static void drawUI();
 static void addTaskOverlay();
-static void addCategoryOverlay(int taskIndex, bool forCompleted);
+static std::string editTaskOverlay(const std::string &currentText);
+static void addCategoryOverlay();
 static void listCategoriesOverlay();
-static void completeTask();
-static void deleteTask();
+static void completeTaskUI();
+static void deleteTaskUI();
 static void gotoItem(int itemNum);
 static void setReminderOverlay();
 
-long long convertToSeconds(long long quantity, char unit) {
-    switch (unit) {
-        case 's': return quantity;
-        case 'm': return quantity * 60;
-        case 'h': return quantity * 3600;
-        case 'd': return quantity * 86400;
-        default:  return quantity; // fallback to seconds
-    }
-}
-
+// Returns the current Unix timestamp in seconds.
 long long get_unix_timestamp() {
     auto now = std::chrono::system_clock::now();
     auto duration = now.time_since_epoch();
@@ -81,994 +42,621 @@ long long get_unix_timestamp() {
     return timestamp;
 }
 
-
+// A simple ncurses function to get a string from the user.
 static std::string ncursesGetString(WINDOW* win, int startY, int startX, int maxLen = 1024, std::string result = "") {
-    wchar_t ch;
-    int cursorPos = result.size();  // Track cursor position within string
+    int ch;
+    int cursorPos = result.size();
     wmove(win, startY, startX + cursorPos);
     wrefresh(win);
-    curs_set(1);  // Show cursor
-
+    curs_set(1);
     while (true) {
-        ch = getch();
-
+        ch = wgetch(win);
         if (ch == '\n' || ch == '\r') {
-            // Enter pressed - return final string
             break;
-        } else if (ch == 27) { 
-            // ESC pressed - cancel edit
+        } else if (ch == 27) { // ESC cancels editing
             result.clear();
             break;
         } else if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
             if (!result.empty() && cursorPos > 0) {
-                result.erase(cursorPos - 1, 1);  // Remove character at cursorPos - 1
+                result.erase(cursorPos - 1, 1);
                 cursorPos--;
-
-                // Redraw the string with shift effect
-                mvwprintw(win, startY, startX, "%s ", result.c_str());  // Clear extra char
+                mvwprintw(win, startY, startX, "%s ", result.c_str());
                 wmove(win, startY, startX + cursorPos);
             }
         } else if (ch == KEY_LEFT) {
-            if (cursorPos > 0) {
-                cursorPos--;
-                wmove(win, startY, startX + cursorPos);
-            }
+            if (cursorPos > 0) { cursorPos--; wmove(win, startY, startX + cursorPos); }
         } else if (ch == KEY_RIGHT) {
-            if (cursorPos < (int)result.size()) {
-                cursorPos++;
-                wmove(win, startY, startX + cursorPos);
-            }
+            if (cursorPos < (int)result.size()) { cursorPos++; wmove(win, startY, startX + cursorPos); }
         } else if (ch >= 32 && ch < 127) {
-            // Insert character at cursor position instead of overwriting
             if ((int)result.size() < maxLen) {
                 result.insert(cursorPos, 1, static_cast<char>(ch));
                 cursorPos++;
-
-                // Redraw entire string to reflect the inserted char
-                mvwprintw(win, startY, startX, "%s ", result.c_str());  // Extra space to clear last char
+                mvwprintw(win, startY, startX, "%s ", result.c_str());
                 wmove(win, startY, startX + cursorPos);
             }
         }
-
         wrefresh(win);
     }
-
-    curs_set(0);  // Hide cursor again
+    curs_set(0);
     return result;
 }
 
-// Load notifications from NOTIFICATION_FILE
-void loadNotifications() {
-    std::vector<Notification> notifs;
-    std::ifstream inFile(NOTIFICATION_FILE);
-
-    std::string line;
-    while (std::getline(inFile, line)) {
-        if (line.empty()) continue;
-        std::stringstream ss(line);
-        std::string part;
-
-        Notification n;
-        // Format: <epoch_timestamp>;<triggered_flag>;<message>
-        if (std::getline(ss, part, ';')) {
-            n.scheduledTime = std::stoll(part);
-        }
-        if (std::getline(ss, part, ';')) {
-            n.triggered = (part == "1");
-        }
-        if (std::getline(ss, part)) {
-            n.message = part;
-        }
-        notifs.push_back(n);
-    }
-    inFile.close();
-    notifications = notifs;
-}
-
-// Save notifications to NOTIFICATION_FILE
-void saveNotifications() {
-    std::ofstream outFile(NOTIFICATION_FILE, std::ios::trunc);
-
-    for (auto &n : notifications) {
-        outFile << n.scheduledTime << ";"
-                << (n.triggered ? "1" : "0") << ";"
-                << n.message << "\n";
-    }
-    outFile.close();
-}
-
-// Load tasks from TODO_FILE
-std::vector<Task> loadTasksFromFile() {
-    std::vector<Task> result;
-    std::ifstream inFile(TODO_FILE);
-    if (!inFile.is_open()) {
-        return result; // empty if no file
-    }
-
-    std::string line;
-    while (std::getline(inFile, line)) {
-        if (line.empty()) continue;
-        std::stringstream ss(line);
-        std::string part;
-
-        Task t;
-        // We assume the format is:
-        // dates[0];dates[1];completed;task;category;notification.scheduledTime
-        // all separated by semicolons, on one line per task.
-
-        if (std::getline(ss, part, ';')) {
-            t.dates[0] = std::stoll(part);
-        }
-        if (std::getline(ss, part, ';')) {
-            t.dates[1] = std::stoll(part);
-        }
-        if (std::getline(ss, part, ';')) {
-            t.completed = (part == "1");
-        }
-        if (std::getline(ss, part, ';')) {
-            t.task = part;
-        }
-        if (std::getline(ss, part, ';')) {
-            t.category = part;
-        }
-        if (std::getline(ss, part, ';')) {
-            t.notification.scheduledTime = std::stoll(part);
-        }
-        // We'll look up the matching Notification in the global notifications vector
-        // if it exists:
-        for (size_t i = 0; i < notifications.size(); i++) {
-            if (t.notification.scheduledTime == notifications[i].scheduledTime) {
-                t.notification = notifications[i];
-                break;
-            }
-        }
-        result.push_back(t);
-    }
-    inFile.close();
-    return result;
-}
-
-// Save tasks to TODO_FILE (one line per task)
-void saveTasks() {
-    std::ofstream outFile(TODO_FILE, std::ios::trunc);
-    if (!outFile.is_open()) {
-        return;
-    }
-    for (auto &t : allTasks) {
-        outFile << t.dates[0] << ";"
-                << t.dates[1] << ";"
-                << (t.completed ? "1" : "0") << ";"
-                << t.task << ";"
-                << t.category << ";"
-                << t.notification.scheduledTime << "\n";
-    }
-    outFile.close();
-}
-
-// Helper to draw text in a wrapped manner inside a curses window.
+// Draw wrapped text inside a window.
 static int drawWrappedText(WINDOW* win, int startY, int startX, int width, const std::string& text) {
-    if (text.empty()) {
-        mvwprintw(win, startY, startX, "%s", "");
-        return 1;
-    }
-
+    if (text.empty()) { mvwprintw(win, startY, startX, ""); return 1; }
     int lineCount = 0;
-    int len = (int)text.size();
+    int len = text.size();
     int pos = 0;
-
     while (pos < len) {
         int end = pos + width;
         if (end > len) end = len;
-
-        // Try not to break words
         if (end < len) {
             int tmp = end;
-            while (tmp > pos && !std::isspace(static_cast<unsigned char>(text[tmp]))) {
-                tmp--;
-            }
-            if (tmp == pos) {
-                // can't break earlier, just break at 'end'
-                end = pos + width;
-            } else {
-                end = tmp;
-            }
+            while (tmp > pos && !std::isspace((unsigned char)text[tmp])) { tmp--; }
+            if (tmp == pos) { end = pos + width; }
+            else { end = tmp; }
         }
-
-        int substrLen = end - pos;
-        if (substrLen > width) {
-            substrLen = width;
-        }
-        std::string buffer = text.substr(pos, substrLen);
+        std::string buffer = text.substr(pos, end - pos);
         mvwprintw(win, startY + lineCount, startX, "%s", buffer.c_str());
-
-        // move to the next segment
         pos = end;
-        while (pos < len && std::isspace(static_cast<unsigned char>(text[pos]))) {
-            pos++;
-        }
+        while (pos < len && std::isspace((unsigned char)text[pos])) { pos++; }
         lineCount++;
     }
-
     return (lineCount > 0) ? lineCount : 1;
 }
 
-// Safely format date/time info for a Task in two columns:
-//   - notification time
-//   - creation/completion time
-// Return a 2-element vector of strings: [reminder_time, relevant_date]
-std::vector<std::string> formatDate(const Task &task) {
-    std::vector<std::string> tuple(2);
+// A temporary structure for holding a task (with any reminder data) fetched from the DB.
+struct DBTask {
+    int id;
+    long long created_at;
+    long long completed_at;
+    int completed;
+    std::string task;
+    std::string category;
+    long long scheduled_time;
+    int triggered;
+    std::string notification_message;
+};
 
-    // If the user has scheduled a reminder in the future
-    // (or it might be in the past), let's show that time:
-    long long st = task.notification.scheduledTime;
-
-    // We'll pick `task.dates[0]` if not completed, else `task.dates[1]`.
-    long long date = (task.completed ? task.dates[1] : task.dates[0]);
-
-    std::time_t tReminder = (std::time_t)st;
-    std::time_t tDate     = (std::time_t)date;
-
-    char bufReminder[64];
-    char bufDate[64];
-
-    // If st == 0, might mean "no reminder set"
-    if (st == 0) {
-        snprintf(bufReminder, sizeof(bufReminder), " ");
-    } else {
-        std::strftime(bufReminder, sizeof(bufReminder), "%Y-%m-%d %H:%M", std::localtime(&tReminder));
+// Initialize the database (create tables if they don’t exist).
+void initDB() {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) {
+        std::cerr << "Can't open DB: " << sqlite3_errmsg(db) << "\n";
+        return;
     }
-
-    // Format creation/completion date
-    std::strftime(bufDate, sizeof(bufDate), "%Y-%m-%d %H:%M", std::localtime(&tDate));
-
-    tuple[0] = bufReminder;
-    tuple[1] = bufDate;
-    return tuple;
+    const char* sqlTasks =
+        "CREATE TABLE IF NOT EXISTS tasks ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "created_at INTEGER NOT NULL, "
+        "completed_at INTEGER, "
+        "completed INTEGER NOT NULL, "
+        "task TEXT NOT NULL, "
+        "category TEXT, "
+        "notification_id INTEGER"
+        ");";
+    char* errMsg = nullptr;
+    if (sqlite3_exec(db, sqlTasks, nullptr, nullptr, &errMsg) != SQLITE_OK) {
+        std::cerr << "Error creating tasks table: " << errMsg << "\n";
+        sqlite3_free(errMsg);
+    }
+    const char* sqlNotifications =
+        "CREATE TABLE IF NOT EXISTS notifications ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "scheduled_time INTEGER NOT NULL, "
+        "triggered INTEGER NOT NULL, "
+        "message TEXT"
+        ");";
+    if (sqlite3_exec(db, sqlNotifications, nullptr, nullptr, &errMsg) != SQLITE_OK) {
+        std::cerr << "Error creating notifications table: " << errMsg << "\n";
+        sqlite3_free(errMsg);
+    }
+    sqlite3_close(db);
 }
 
-// Filter out tasks into currentTasks or completedTasks
-void filterTasks(const std::vector<Task>& raw) {
-    currentTasks.clear();
-    completedTasks.clear();
-
-    for (size_t i = 0; i < raw.size(); i++) {
-        if (raw[i].completed) {
-            completedTasks.push_back(raw[i]);
+// Fetch tasks from the database (using a LEFT JOIN to include reminder info).
+std::vector<DBTask> fetchTasks(int completedFlag, const std::string &filterCategory) {
+    std::vector<DBTask> tasks;
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) return tasks;
+    std::string sql =
+        "SELECT t.id, t.task, t.completed, t.created_at, t.completed_at, t.category, "
+        "n.scheduled_time, n.triggered, n.message "
+        "FROM tasks t LEFT JOIN notifications n ON t.notification_id = n.id "
+        "WHERE t.completed = ?";
+    if (filterCategory != "All") { sql += " AND t.category = ?"; }
+    sql += " ORDER BY t.created_at ASC;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        sqlite3_close(db);
+        return tasks;
+    }
+    sqlite3_bind_int(stmt, 1, completedFlag);
+    if (filterCategory != "All") { sqlite3_bind_text(stmt, 2, filterCategory.c_str(), -1, SQLITE_TRANSIENT); }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        DBTask task;
+        task.id = sqlite3_column_int(stmt, 0);
+        task.task = (const char*)sqlite3_column_text(stmt, 1);
+        task.completed = sqlite3_column_int(stmt, 2);
+        task.created_at = sqlite3_column_int64(stmt, 3);
+        task.completed_at = (sqlite3_column_type(stmt, 4) == SQLITE_NULL) ? 0 : sqlite3_column_int64(stmt, 4);
+        task.category = (const char*)sqlite3_column_text(stmt, 5);
+        if (sqlite3_column_type(stmt, 6) == SQLITE_NULL) {
+            task.scheduled_time = 0;
+            task.triggered = 0;
+            task.notification_message = "";
         } else {
-            currentTasks.push_back(raw[i]);
+            task.scheduled_time = sqlite3_column_int64(stmt, 6);
+            task.triggered = sqlite3_column_int(stmt, 7);
+            task.notification_message = (const char*)sqlite3_column_text(stmt, 8);
         }
+        tasks.push_back(task);
     }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return tasks;
 }
 
-// Draw the list portion of the UI
+// --- Direct DB operations (each function immediately updates the DB) ---
+
+// Insert a new task into the DB.
+int addTask(const std::string &taskText, const std::string &category) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) return -1;
+    const char* sql = "INSERT INTO tasks (created_at, completed, task, category) VALUES (?, 0, ?, ?);";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) { sqlite3_close(db); return -1; }
+    long long now = get_unix_timestamp();
+    sqlite3_bind_int64(stmt, 1, now);
+    sqlite3_bind_text(stmt, 2, taskText.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, category.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    int newId = sqlite3_last_insert_rowid(db);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return (rc == SQLITE_DONE) ? newId : -1;
+}
+
+// Update a task’s text.
+bool updateTaskText(int taskId, const std::string &newText) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) return false;
+    const char* sql = "UPDATE tasks SET task = ? WHERE id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) { sqlite3_close(db); return false; }
+    sqlite3_bind_text(stmt, 1, newText.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, taskId);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return (rc == SQLITE_DONE);
+}
+
+// Update a task’s category.
+bool updateTaskCategory(int taskId, const std::string &newCategory) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) return false;
+    const char* sql = "UPDATE tasks SET category = ? WHERE id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) { sqlite3_close(db); return false; }
+    sqlite3_bind_text(stmt, 1, newCategory.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, taskId);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return (rc == SQLITE_DONE);
+}
+
+// Mark a task as completed.
+bool markTaskCompleted(int taskId) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) return false;
+    const char* sql = "UPDATE tasks SET completed = 1, completed_at = ? WHERE id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) { sqlite3_close(db); return false; }
+    long long now = get_unix_timestamp();
+    sqlite3_bind_int64(stmt, 1, now);
+    sqlite3_bind_int(stmt, 2, taskId);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return (rc == SQLITE_DONE);
+}
+
+// Delete a task.
+bool removeTask(int taskId) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) return false;
+    const char* sql = "DELETE FROM tasks WHERE id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) { sqlite3_close(db); return false; }
+    sqlite3_bind_int(stmt, 1, taskId);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return (rc == SQLITE_DONE);
+}
+
+// Add a reminder for a task: insert into notifications and update the task’s notification_id.
+bool addReminderToTask(int taskId, long long scheduledTime, const std::string &message) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) return false;
+    const char* sqlInsert = "INSERT INTO notifications (scheduled_time, triggered, message) VALUES (?, 0, ?);";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sqlInsert, -1, &stmt, nullptr) != SQLITE_OK) { sqlite3_close(db); return false; }
+    sqlite3_bind_int64(stmt, 1, scheduledTime);
+    sqlite3_bind_text(stmt, 2, message.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) { sqlite3_finalize(stmt); sqlite3_close(db); return false; }
+    int reminderId = sqlite3_last_insert_rowid(db);
+    sqlite3_finalize(stmt);
+    const char* sqlUpdate = "UPDATE tasks SET notification_id = ? WHERE id = ?;";
+    if (sqlite3_prepare_v2(db, sqlUpdate, -1, &stmt, nullptr) != SQLITE_OK) { sqlite3_close(db); return false; }
+    sqlite3_bind_int(stmt, 1, reminderId);
+    sqlite3_bind_int(stmt, 2, taskId);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return (rc == SQLITE_DONE);
+}
+
+// --- UI functions ---
+
+// Draw the list window using the current DB state.
 static void drawListUI() {
-    // Determine column names based on view mode
     const char* colnames = (viewMode == 0) ? " Current Tasks " : " Completed Tasks ";
     const char* colcat   = " Category ";
     const char* coldates = (viewMode == 0) ? " Added on " : " Completed on ";
     const char* reminder = " Reminder ";
-
     werase(listWin);
+    wbkgd(listWin, COLOR_PAIR(4));  // Apply to the whole stdscr
+    wrefresh(listWin);
     box(listWin, 0, 0);
 
-    // top line inside the box
+
+
+
+
     mvwprintw(listWin, 0, 2, " # ");
     mvwprintw(listWin, 0, 6, "%s", colnames);
-
     int dateColumnPos     = getmaxx(listWin) - 18;
     int reminderColPos    = getmaxx(listWin) - 56;
     int categoryColumnPos = getmaxx(listWin) - 36;
-
     mvwprintw(listWin, 0, reminderColPos, "%s", reminder);
     mvwprintw(listWin, 0, categoryColumnPos, "%s", colcat);
     mvwprintw(listWin, 0, dateColumnPos, "%s", coldates);
-
-    // We will refer to either currentTasks or completedTasks
-    const std::vector<Task> &temp = (viewMode == 0) ? currentTasks : completedTasks;
-
-    // Build list of tasks that match activeFilterCategory
-    std::vector<int> filteredIndices;
-    filteredIndices.reserve(temp.size());
-    for (int i = 0; i < (int)temp.size(); i++) {
-        if (activeFilterCategory == "All" || temp[i].category == activeFilterCategory) {
-            filteredIndices.push_back(i);
-        }
+    std::vector<DBTask> tasks = fetchTasks((viewMode == 0 ? 0 : 1), activeFilterCategory);
+    if (tasks.empty()) { selectedIndex = 0; }
+    else {
+        if (selectedIndex >= (int)tasks.size()) selectedIndex = tasks.size() - 1;
+        if (selectedIndex < 0) selectedIndex = 0;
     }
-    // Clamp selectedIndex
-    if (!filteredIndices.empty()) {
-        if (selectedIndex >= (int)filteredIndices.size()) {
-            selectedIndex = (int)filteredIndices.size() - 1;
-        }
-        if (selectedIndex < 0) {
-            selectedIndex = 0;
-        }
-    } else {
-        selectedIndex = 0;
-    }
-
-    int taskCount = (int)filteredIndices.size();
     int visibleLines = getmaxy(listWin) - 2;
-    int scrollOffset = 0;
-    if (selectedIndex >= visibleLines) {
-        scrollOffset = selectedIndex - (visibleLines - 1);
-    }
-
+    int scrollOffset = (selectedIndex >= visibleLines) ? selectedIndex - (visibleLines - 1) : 0;
     int currentY = 1;
-    for (int idx = scrollOffset; idx < taskCount; idx++) {
-        if (currentY >= getmaxy(listWin) - 1) {
-            break;
-        }
-        int realIndex = filteredIndices[idx];
-        if (idx == selectedIndex) {
+    for (int idx = scrollOffset; idx < (int)tasks.size(); idx++) {
+        if (currentY >= getmaxy(listWin) - 1) break;
+        if (idx == selectedIndex)
             wattron(listWin, COLOR_PAIR(2));
-        } else {
+        else
             wattron(listWin, COLOR_PAIR(3));
+        mvwprintw(listWin, currentY, 2, "%-3d", idx + 1);
+        mvwprintw(listWin, currentY, categoryColumnPos, "%-12s", tasks[idx].category.c_str());
+        char bufDate[64];
+        time_t tDate = (time_t)((viewMode == 0) ? tasks[idx].created_at : tasks[idx].completed_at);
+        std::strftime(bufDate, sizeof(bufDate), "%Y-%m-%d %H:%M", std::localtime(&tDate));
+        mvwprintw(listWin, currentY, dateColumnPos, "%s", bufDate);
+        char bufReminder[64] = "";
+        if (tasks[idx].scheduled_time != 0) {
+            time_t tRem = (time_t)tasks[idx].scheduled_time;
+            std::strftime(bufReminder, sizeof(bufReminder), "%Y-%m-%d %H:%M", std::localtime(&tRem));
         }
-
-        // Show the item number (1-based)
-        mvwprintw(listWin, currentY, 2, "%-3d", realIndex + 1);
-
-        // Show the category
-        mvwprintw(listWin, currentY, categoryColumnPos, "%-12s", temp[realIndex].category.c_str());
-
-        // Format the date/time strings
-        auto datesStr = formatDate(temp[realIndex]);
-        std::string reminderDate = datesStr[0];
-        std::string mainDate     = datesStr[1];
-
-        mvwprintw(listWin, currentY, dateColumnPos, "%s", mainDate.c_str());
-        mvwprintw(listWin, currentY, reminderColPos, "%s", reminderDate.c_str());
-
-        // The task text (wrapped)
-        int linesUsed = drawWrappedText(listWin, currentY, 6,
-                                        reminderColPos - 7,
-                                        temp[realIndex].task);
-
-        if (idx == selectedIndex) {
+        mvwprintw(listWin, currentY, reminderColPos, "%s", bufReminder);
+        int linesUsed = drawWrappedText(listWin, currentY, 6, reminderColPos - 7, tasks[idx].task);
+        if (idx == selectedIndex)
             wattroff(listWin, COLOR_PAIR(2));
-        } else {
+        else
             wattroff(listWin, COLOR_PAIR(3));
-        }
         currentY += linesUsed;
     }
-
     wnoutrefresh(stdscr);
     wnoutrefresh(listWin);
 }
 
+// Draw the overall UI.
 static void drawUI() {
-    // Draw header on stdscr
     wattron(stdscr, COLOR_PAIR(3));
     mvprintw(1, 2, "CLI TODO APP");
-    mvprintw(2, 2, "Current Tasks: %zu | Completed Tasks: %zu",
-             currentTasks.size(), completedTasks.size());
+    mvprintw(2, 2, "View Mode: %s", (viewMode == 0 ? "Current" : "Completed"));
     mvhline(3, 2, ACS_HLINE, COLS - 4);
-    mvprintw(4, 2, "Keys: c=complete, d=delete, n=add, s=category, r=reminder, e=edit, #:filter, Tab=switch, q=save+exit");
+    mvprintw(4, 2, "Keys: c=complete, d=delete, n=add, s=category, r=reminder, e=edit, #:filter, Tab=switch, q=exit");
     mvprintw(5, 2, "Nav: Up/Down, PgUp/PgDn, Home/End, Goto ':<num>'");
-    mvprintw(6, 2, "Category Filter: %s                 ", activeFilterCategory.c_str() );
+    mvprintw(6, 2, "Category Filter: %s                 ", activeFilterCategory.c_str());
     wattroff(stdscr, COLOR_PAIR(3));
-
     drawListUI();
+    doupdate();
 }
 
-// Overlay to add a new task
+// Overlay to add a new task.
 static void addTaskOverlay() {
-    int overlayHeight = 7;
-    int overlayWidth = COLS - 20;
-    int overlayY = (LINES - overlayHeight) / 2;
-    int overlayX = (COLS - overlayWidth) / 2;
-
+    int overlayHeight = 7, overlayWidth = COLS - 20;
+    int overlayY = (LINES - overlayHeight) / 2, overlayX = (COLS - overlayWidth) / 2;
     WINDOW* overlayWin = newwin(overlayHeight, overlayWidth, overlayY, overlayX);
     wbkgd(overlayWin, COLOR_PAIR(3));
     box(overlayWin, 0, 0);
     mvwprintw(overlayWin, 1, 2, "Enter new task:");
     wrefresh(overlayWin);
-
-    Task new_task;
-    new_task.task = ncursesGetString(overlayWin, 2, 2, 1024);
-
-    if (!new_task.task.empty()) {
-        // Set creation time
-        new_task.dates[0] = get_unix_timestamp();
-        new_task.dates[1] = 0; // not completed yet
-        new_task.completed = false;
-        // Insert it into the master list
-        allTasks.push_back(new_task);
-        // Also into current tasks
-        currentTasks.push_back(new_task);
-        // The newly added task is at index = currentTasks.size()-1
-        int idx = (int)currentTasks.size() - 1;
-        // (because addCategoryOverlay changes currentTasks[idx].category)
-        allTasks.back().category = currentTasks[idx].category;
-
-    }
+    std::string taskText = ncursesGetString(overlayWin, 2, 2, 1024);
+    if (!taskText.empty()) { addTask(taskText, ""); }
     delwin(overlayWin);
 }
 
-
-// Overlay to add a new task
-std::string editTaskOverlay(Task task) {
-    int overlayHeight = 7;
-    int overlayWidth = COLS - 20;
-    int overlayY = (LINES - overlayHeight) / 2;
-    int overlayX = (COLS - overlayWidth) / 2;
+// Overlay to edit a task.
+std::string editTaskOverlay(const std::string &currentText) {
+    int overlayHeight = 7, overlayWidth = COLS - 20;
+    int overlayY = (LINES - overlayHeight) / 2, overlayX = (COLS - overlayWidth) / 2;
     WINDOW* overlayWin = newwin(overlayHeight, overlayWidth, overlayY, overlayX);
     wbkgd(overlayWin, COLOR_PAIR(3));
     box(overlayWin, 0, 0);
     mvwprintw(overlayWin, 1, 2, "Edit task:");
-    mvwprintw(overlayWin, 2, 2, "%s", task.task.c_str());
+    mvwprintw(overlayWin, 2, 2, "%s", currentText.c_str());
     wrefresh(overlayWin);
-    std::string edit_task = ncursesGetString(overlayWin, 2, 2, 1024, task.task);
+    std::string newText = ncursesGetString(overlayWin, 2, 2, 1024, currentText);
     delwin(overlayWin);
-    return edit_task;
+    return newText;
 }
 
-
-// Overlay to set/update category for an item
-static void addCategoryOverlay(int taskIndex, bool forCompleted) {
-    int overlayHeight = 7;
-    int overlayWidth = COLS - 20;
-    int overlayY = (LINES - overlayHeight) / 2;
-    int overlayX = (COLS - overlayWidth) / 2;
-
+// Overlay to update the category for the selected task.
+static void addCategoryOverlay() {
+    int overlayHeight = 7, overlayWidth = COLS - 20;
+    int overlayY = (LINES - overlayHeight) / 2, overlayX = (COLS - overlayWidth) / 2;
     WINDOW* overlayWin = newwin(overlayHeight, overlayWidth, overlayY, overlayX);
     wbkgd(overlayWin, COLOR_PAIR(3));
     box(overlayWin, 0, 0);
-
-    // Grab a reference to the actual Task we want
-    Task &theTask = (forCompleted ? completedTasks[taskIndex]
-                                  : currentTasks[taskIndex]);
-
-    mvwprintw(overlayWin, 1, 2, "Enter category for %s item #%d:",
-              (forCompleted ? "completed" : "current"), taskIndex+1);
-
+    mvwprintw(overlayWin, 1, 2, "Enter new category:");
     wmove(overlayWin, 2, 2);
     wrefresh(overlayWin);
-    // Pre-fill existing category
-    waddstr(overlayWin, theTask.category.c_str());
-    wrefresh(overlayWin);
-
-    std::string newCat = ncursesGetString(overlayWin, 2, 2, 1024, theTask.category);
+    std::string newCat = ncursesGetString(overlayWin, 2, 2, 1024);
     if (!newCat.empty()) {
-        if (newCat.size() >= 17) {
-            newCat.erase(newCat.size() - 17);  // Remove the last 17 characters safely
+        std::vector<DBTask> tasks = fetchTasks((viewMode == 0 ? 0 : 1), activeFilterCategory);
+        if (!tasks.empty() && selectedIndex < (int)tasks.size()) {
+            updateTaskCategory(tasks[selectedIndex].id, newCat);
         }
-        theTask.category = newCat;
-
     }
     delwin(overlayWin);
 }
 
-// Overlay listing categories to filter
+// Overlay listing categories (fetched from the DB) to set the filter.
 static void listCategoriesOverlay() {
-    // We gather categories from whichever vector we are viewing
-    const std::vector<Task> &vec = (viewMode == 0) ? currentTasks : completedTasks;
-
+    sqlite3* db = nullptr;
     std::set<std::string> uniqueCats;
-    for (auto &t : vec) {
-        if (!t.category.empty()) {
-            uniqueCats.insert(t.category);
+    if (sqlite3_open(DB_PATH.c_str(), &db) == SQLITE_OK) {
+        const char* sql = "SELECT DISTINCT category FROM tasks WHERE category IS NOT NULL AND category != '';";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char* cat = (const char*)sqlite3_column_text(stmt, 0);
+                if (cat) uniqueCats.insert(cat);
+            }
+            sqlite3_finalize(stmt);
         }
+        sqlite3_close(db);
     }
-
-    // put them in a vector for indexing
-    std::vector<std::string> catList;
-    catList.push_back("All");
-    for (auto &c : uniqueCats) {
-        catList.push_back(c);
-    }
-
-    int overlayHeight = 5 + (int)catList.size();
-    if (overlayHeight > LINES - 2) {
-        overlayHeight = LINES - 2;
-    }
+    std::vector<std::string> catList; catList.push_back("All");
+    for (auto &c : uniqueCats) { catList.push_back(c); }
+    int overlayHeight = 5 + catList.size();
+    if (overlayHeight > LINES - 2) overlayHeight = LINES - 2;
     int overlayWidth = 40;
-    int overlayY = (LINES - overlayHeight) / 2;
-    int overlayX = (COLS - overlayWidth) / 2;
-
+    int overlayY = (LINES - overlayHeight) / 2, overlayX = (COLS - overlayWidth) / 2;
     WINDOW* overlayWin = newwin(overlayHeight, overlayWidth, overlayY, overlayX);
     wbkgd(overlayWin, COLOR_PAIR(3));
     box(overlayWin, 0, 0);
-
     mvwprintw(overlayWin, 1, 2, "Select a category to filter:");
     wrefresh(overlayWin);
-
     int catSelected = 0;
     keypad(overlayWin, true);
-
     while (true) {
         for (int i = 0; i < (int)catList.size(); i++) {
-            if (i + 3 >= overlayHeight - 1) {
-                break;
-            }
-            if (i == catSelected) {
-                wattron(overlayWin, COLOR_PAIR(2));
-            } else {
-                wattron(overlayWin, COLOR_PAIR(3));
-            }
+            if (i + 3 >= overlayHeight - 1) break;
+            if (i == catSelected) wattron(overlayWin, COLOR_PAIR(2));
+            else wattroff(overlayWin, COLOR_PAIR(2));
             mvwprintw(overlayWin, i + 3, 2, "%s  ", catList[i].c_str());
-            if (i == catSelected) {
-                wattroff(overlayWin, COLOR_PAIR(2));
-            } else {
-                wattroff(overlayWin, COLOR_PAIR(3));
-            }
         }
         wrefresh(overlayWin);
-
         int ch = wgetch(overlayWin);
-        if (ch == KEY_UP) {
-            if (catSelected > 0) {
-                catSelected--;
-            }
-        } else if (ch == KEY_DOWN) {
-            if (catSelected < (int)catList.size() - 1) {
-                catSelected++;
-            }
-        } else if (ch == 'q' || ch == 27) {
-            // q or ESC = cancel
-            break;
-        } else if (ch == '\n' || ch == '\r') {
-            activeFilterCategory = catList[catSelected];
-            break;
-        }
+        if (ch == KEY_UP) { if (catSelected > 0) catSelected--; }
+        else if (ch == KEY_DOWN) { if (catSelected < (int)catList.size() - 1) catSelected++; }
+        else if (ch == 'q' || ch == 27) { break; }
+        else if (ch == '\n' || ch == '\r') { activeFilterCategory = catList[catSelected]; break; }
     }
-
     delwin(overlayWin);
 }
 
-static void completeTask() {
-    if (viewMode != 0) return;  // only valid in current-view
-    if (currentTasks.empty()) return;
-
-    // Build filteredIndices
-    std::vector<int> filteredIndices;
-    for (int i = 0; i < (int)currentTasks.size(); i++) {
-        if (activeFilterCategory == "All" || currentTasks[i].category == activeFilterCategory) {
-            filteredIndices.push_back(i);
-        }
-    }
-    if (filteredIndices.empty()) return;
-    if (selectedIndex >= (int)filteredIndices.size()) return;
-
-    int realIndex = filteredIndices[selectedIndex];
-    // Mark it completed
-    Task t = currentTasks[realIndex];
-    t.completed = true;
-    t.dates[1] = get_unix_timestamp();
-
-    // Also update in allTasks
-    // We can find it by pointer or by some ID, but for simplicity:
-    for (int i = 0; i < allTasks.size(); i++) {
-
-        if (allTasks[i].dates[0] == t.dates[0]) {
-            allTasks[i].completed = true;
-            allTasks[i].dates[1] = t.dates[1];
-            break;
-        }
-    }
-
-    // Move from currentTasks to completedTasks
-    completedTasks.push_back(t);
-    currentTasks.erase(currentTasks.begin() + realIndex);
-
-    // Adjust index if needed
-    if (selectedIndex >= (int)filteredIndices.size()) {
-        selectedIndex = (int)filteredIndices.size() - 1;
-    }
-    if (selectedIndex < 0) selectedIndex = 0;
+// Mark the selected task as completed.
+static void completeTaskUI() {
+    std::vector<DBTask> tasks = fetchTasks(0, activeFilterCategory);
+    if (tasks.empty() || selectedIndex >= (int)tasks.size()) return;
+    markTaskCompleted(tasks[selectedIndex].id);
 }
 
-
-
-void editTask() {
-    const std::vector<Task>& temp = (viewMode == 0) ? currentTasks : completedTasks;
-    std::vector<int> filteredIndices;
-
-    for (int i = 0; i < (int)temp.size(); i++) {
-        if (activeFilterCategory == "All" || temp[i].category == activeFilterCategory) {
-            filteredIndices.push_back(i);
-        }
-    }
-
-    if (!filteredIndices.empty() && selectedIndex < (int)filteredIndices.size()) {
-        int realIndex = filteredIndices[selectedIndex];
-
-        std::string edited_task;
-        
-        if (viewMode == 0) {
-            // Edit current tasks
-            Task& updated = currentTasks[realIndex];  // Use reference to modify directly
-            edited_task = editTaskOverlay(updated);
-            updated.task = edited_task;  // Apply changes
-
-            // Update the corresponding task in allTasks
-            for (Task& task : allTasks) {
-                if (task.dates[0] == updated.dates[0]) {
-                    task.task = edited_task;
-                }
-            }
-        } else {
-            // Edit completed tasks
-            Task& updated = completedTasks[realIndex];  // Use reference to modify directly
-            edited_task = editTaskOverlay(updated);
-            updated.task = edited_task;  // Apply changes
-
-            // Update the corresponding task in allTasks
-            for (Task& task : allTasks) {
-                if (task.dates[0] == updated.dates[0]) {
-                    task.task = edited_task;
-                }
-            }
-        }
-    }
+// Edit the selected task.
+void editTaskUI() {
+    std::vector<DBTask> tasks = fetchTasks((viewMode == 0 ? 0 : 1), activeFilterCategory);
+    if (tasks.empty() || selectedIndex >= (int)tasks.size()) return;
+    int taskId = tasks[selectedIndex].id;
+    std::string newText = editTaskOverlay(tasks[selectedIndex].task);
+    if (!newText.empty()) { updateTaskText(taskId, newText); }
 }
 
-
-static void deleteTask() {
-    // Decide which vector to remove from
-    std::vector<Task> &vec = (viewMode == 0) ? currentTasks : completedTasks;
-    if (vec.empty()) return;
-
-    std::vector<int> filteredIndices;
-    for (int i = 0; i < (int)vec.size(); i++) {
-        if (activeFilterCategory == "All" || vec[i].category == activeFilterCategory) {
-            filteredIndices.push_back(i);
-        }
-    }
-    if (filteredIndices.empty()) return;
-    if (selectedIndex >= (int)filteredIndices.size()) return;
-
-    int realIndex = filteredIndices[selectedIndex];
-
-    // Keep pointer so we can find it in allTasks
-    Task delTask = vec[realIndex];
-
-    // Remove from the "master" allTasks as well
-    // (One simple approach: compare addresses or compare a unique field like creation time + task text)
-    for (int i = 0; i < (int)allTasks.size(); i++) {
-        if (allTasks[i].dates[0] == delTask.dates[0]) {
-            allTasks.erase(allTasks.begin() + i);
-            break;
-        }
-    }
-
-    vec.erase(vec.begin() + realIndex);
-
-    if (selectedIndex >= (int)filteredIndices.size()) {
-        selectedIndex = (int)filteredIndices.size() - 1;
-    }
-    if (selectedIndex < 0) selectedIndex = 0; 
+// Delete the selected task.
+static void deleteTaskUI() {
+    std::vector<DBTask> tasks = fetchTasks((viewMode == 0 ? 0 : 1), activeFilterCategory);
+    if (tasks.empty() || selectedIndex >= (int)tasks.size()) return;
+    removeTask(tasks[selectedIndex].id);
 }
 
+// Goto a specific task (1-based index).
 static void gotoItem(int itemNum) {
-    // itemNum is 1-based, let's make it 0-based
-    itemNum -= 1;
-
-    const std::vector<Task> &vec = (viewMode == 0) ? currentTasks : completedTasks;
-    if (itemNum < 0 || itemNum >= (int)vec.size()) return;
-
-    std::vector<int> filteredIndices;
-    for (int i = 0; i < (int)vec.size(); i++) {
-        if (activeFilterCategory == "All" || vec[i].category == activeFilterCategory) {
-            filteredIndices.push_back(i);
-        }
-    }
-    for (int fi = 0; fi < (int)filteredIndices.size(); fi++) {
-        if (filteredIndices[fi] == itemNum) {
-            selectedIndex = fi;
-            return;
-        }
-    }
+    std::vector<DBTask> tasks = fetchTasks((viewMode == 0 ? 0 : 1), activeFilterCategory);
+    if (itemNum < 1 || itemNum > (int)tasks.size()) return;
+    selectedIndex = itemNum - 1;
 }
 
-
-// Overlay to set an initial reminder time
-void addNotification(long long scheduled_time) {
-    if (viewMode != 0) return;  // only valid in current-view
-    if (currentTasks.empty()) return;
-
-    // Build filteredIndices
-    std::vector<int> filteredIndices;
-    for (int i = 0; i < (int)currentTasks.size(); i++) {
-        if (activeFilterCategory == "All" || currentTasks[i].category == activeFilterCategory) {
-            filteredIndices.push_back(i);
-        }
-    }
-
-    if (filteredIndices.empty()) return;
-    if (selectedIndex >= (int)filteredIndices.size()) return;
-
-    int realIndex = filteredIndices[selectedIndex];
-
-    Task t = currentTasks[realIndex];
-    t.notification.scheduledTime = scheduled_time;
-    t.notification.message = t.task;
-
-    for (int i = 0; i < allTasks.size(); i++) {
-        if (allTasks[i].dates[0] == t.dates[0]) {
-            allTasks[i] = t;
-            break;
-        }
-    }
-
-    currentTasks[realIndex] = t;
-    notifications.push_back(t.notification);
-};
-
-
-// Overlay to set an initial reminder time
+// Overlay to set a reminder for the selected task.
 void setReminderOverlay() {
-    int overlayHeight = 8;
-    int overlayWidth = 60;
-    int overlayY = (LINES - overlayHeight) / 2;
-    int overlayX = (COLS - overlayWidth) / 2;
-
+    int overlayHeight = 8, overlayWidth = 60;
+    int overlayY = (LINES - overlayHeight) / 2, overlayX = (COLS - overlayWidth) / 2;
     WINDOW* overlayWin = newwin(overlayHeight, overlayWidth, overlayY, overlayX);
     wbkgd(overlayWin, COLOR_PAIR(3));
     box(overlayWin, 0, 0);
-
     mvwprintw(overlayWin, 1, 2, "Set reminder quantity (integer):");
     wmove(overlayWin, 2, 2);
     wrefresh(overlayWin);
-
     std::string qtyStr = ncursesGetString(overlayWin, 2, 2, 32);
     long long quantity = 0;
-    try {
-        quantity = std::stoll(qtyStr);
-    } catch (...) {
-        quantity = 0;
-    }
-
+    try { quantity = std::stoll(qtyStr); } catch (...) { quantity = 0; }
     mvwprintw(overlayWin, 3, 2, "Choose unit: (s)econds, (m)inutes, (h)ours, (d)ays");
     wrefresh(overlayWin);
-    char unitCh = wgetch(overlayWin);
-    if (unitCh >= 'A' && unitCh <= 'Z') {
-        unitCh = unitCh - 'A' + 'a';
+    int unitCh = wgetch(overlayWin);
+    if (unitCh >= 'A' && unitCh <= 'Z') { unitCh = unitCh - 'A' + 'a'; }
+    auto convertToSeconds = [](long long qty, char unit) -> long long {
+        switch (unit) {
+            case 's': return qty;
+            case 'm': return qty * 60;
+            case 'h': return qty * 3600;
+            case 'd': return qty * 86400;
+            default:  return qty;
+        }
+    };
+    long long offsetSeconds = convertToSeconds(quantity, (char)unitCh);
+    long long scheduledTime = get_unix_timestamp() + offsetSeconds;
+    std::vector<DBTask> tasks = fetchTasks(0, activeFilterCategory);
+    if (!tasks.empty() && selectedIndex < (int)tasks.size()) {
+        addReminderToTask(tasks[selectedIndex].id, scheduledTime, tasks[selectedIndex].task);
     }
-
-    long long offsetSeconds = convertToSeconds(quantity, unitCh);
-    time_t now = std::time(nullptr);
-
-    long long scheduledTime = (long long)now + offsetSeconds;
-
-    addNotification(scheduledTime);
     delwin(overlayWin);
 }
 
 int main() {
+    initDB();
     initscr();
     cbreak();
     noecho();
     keypad(stdscr, true);
     curs_set(0);
-
     if (!has_colors()) {
         endwin();
         std::cerr << "Your terminal does not support color." << std::endl;
         return 1;
     }
     start_color();
-    init_pair(1, COLOR_GREEN, COLOR_BLACK);
-    init_pair(2, COLOR_BLACK, COLOR_WHITE);
-    init_pair(3, COLOR_BLUE, COLOR_BLACK);
+    init_pair(1, COLOR_BLUE, COLOR_WHITE);
+    init_pair(2, COLOR_WHITE, COLOR_BLACK);
+    init_pair(3, COLOR_BLUE, COLOR_WHITE);
 
-    int listStartY = 8;
-    int listStartX = 2;
-    int listHeight = LINES - listStartY - 2;
-    int listWidth  = COLS - 4;
 
+    // Change the background color of the entire window
+    bkgd(COLOR_PAIR(4));  // Assuming pair 4 is defined for the background
+
+    // Define a new color pair for the background
+    init_pair(4, COLOR_BLUE, COLOR_WHITE);  // Example: White text on Blue background
+
+    wbkgd(stdscr, COLOR_PAIR(4));  // Apply to the whole stdscr
+    refresh();  // Refresh the screen to apply changes
+
+
+    int listStartY = 8, listStartX = 2;
+    int listHeight = LINES - listStartY - 2, listWidth  = COLS - 4;
     listWin = newwin(listHeight, listWidth, listStartY, listStartX);
     keypad(listWin, true);
-
-    // Load notifications first
-    loadNotifications();
-    allTasks = loadTasksFromFile();
-    filterTasks(allTasks);
-
     selectedIndex = 0;
     drawUI();
-    doupdate();
-
     while (true) {
         int ch = wgetch(stdscr);
         bool needRedraw = false;
-        loadNotifications();
         switch (ch) {
             case 'q':
-                // Save all tasks + notifications
-                saveTasks();
-                loadNotifications();
-                saveNotifications();
                 delwin(listWin);
                 endwin();
                 return 0;
-
             case KEY_UP:
-                if (selectedIndex > 0) {
-                    selectedIndex--;
-                    needRedraw = true;
-                }
+                if (selectedIndex > 0) { selectedIndex--; needRedraw = true; }
                 break;
-
             case KEY_DOWN: {
-                const std::vector<Task> &temp = (viewMode == 0) ? currentTasks : completedTasks;
-                // build filtered indices
-                std::vector<int> filteredIndices;
-                for (int i = 0; i < (int)temp.size(); i++) {
-                    if (activeFilterCategory == "All" || temp[i].category == activeFilterCategory) {
-                        filteredIndices.push_back(i);
-                    }
-                }
-                if (selectedIndex < (int)filteredIndices.size() - 1) {
-                    selectedIndex++;
-                    needRedraw = true;
-                }
+                auto tasks = fetchTasks((viewMode == 0 ? 0 : 1), activeFilterCategory);
+                if (selectedIndex < (int)tasks.size() - 1) { selectedIndex++; needRedraw = true; }
             } break;
-
             case KEY_HOME:
-                if (selectedIndex != 0) {
-                    selectedIndex = 0;
-                    needRedraw = true;
-                }
+                if (selectedIndex != 0) { selectedIndex = 0; needRedraw = true; }
                 break;
-
             case KEY_END: {
-                const std::vector<Task> &temp = (viewMode == 0) ? currentTasks : completedTasks;
-                std::vector<int> filteredIndices;
-                for (int i = 0; i < (int)temp.size(); i++) {
-                    if (activeFilterCategory == "All" || temp[i].category == activeFilterCategory) {
-                        filteredIndices.push_back(i);
-                    }
-                }
-                if (!filteredIndices.empty()) {
-                    selectedIndex = (int)filteredIndices.size() - 1;
-                    needRedraw = true;
-                }
+                auto tasks = fetchTasks((viewMode == 0 ? 0 : 1), activeFilterCategory);
+                if (!tasks.empty()) { selectedIndex = tasks.size() - 1; needRedraw = true; }
             } break;
-
             case KEY_PPAGE:
-                if (selectedIndex > 10) {
-                    selectedIndex -= 10;
-                } else {
-                    selectedIndex = 0;
-                }
+                selectedIndex = (selectedIndex > 10) ? selectedIndex - 10 : 0;
                 needRedraw = true;
                 break;
-
             case KEY_NPAGE: {
-                const std::vector<Task> &temp = (viewMode == 0) ? currentTasks : completedTasks;
-                std::vector<int> filteredIndices;
-                for (int i = 0; i < (int)temp.size(); i++) {
-                    if (activeFilterCategory == "All" || temp[i].category == activeFilterCategory) {
-                        filteredIndices.push_back(i);
-                    }
-                }
-                int limit = (int)filteredIndices.size();
-                if (selectedIndex + 10 < limit) {
-                    selectedIndex += 10;
-                } else {
-                    if (limit > 0) selectedIndex = limit - 1;
-                    else selectedIndex = 0;
-                }
+                auto tasks = fetchTasks((viewMode == 0 ? 0 : 1), activeFilterCategory);
+                selectedIndex = (selectedIndex + 10 < (int)tasks.size()) ? selectedIndex + 10 : tasks.size() - 1;
                 needRedraw = true;
             } break;
-
-            case 'r': 
+            case 'r':
                 setReminderOverlay();
-                saveNotifications();
                 needRedraw = true;
                 break;
-
             case 'n':
                 addTaskOverlay();
                 needRedraw = true;
                 break;
-
             case 'c':
-                completeTask();
+                completeTaskUI();
                 needRedraw = true;
                 break;
-
             case 'd':
-                deleteTask();
+                deleteTaskUI();
                 needRedraw = true;
                 break;
-
-            case 's': {
-                const std::vector<Task> &temp = (viewMode == 0) ? currentTasks : completedTasks;
-                std::vector<int> filteredIndices;
-                for (int i = 0; i < (int)temp.size(); i++) {
-                    if (activeFilterCategory == "All" || temp[i].category == activeFilterCategory) {
-                        filteredIndices.push_back(i);
-                    }
-                }
-                if (!filteredIndices.empty() && selectedIndex < (int)filteredIndices.size()) {
-                    int realIndex = filteredIndices[selectedIndex];
-                    // show overlay
-                    addCategoryOverlay(realIndex, (viewMode == 1));
-                    // Also update allTasks so we don't lose the new category
-                    if (viewMode == 0) {
-                        // current
-                        // find pointer
-                        Task &updated = currentTasks[realIndex];
-                        for (auto &A : allTasks) {
-                            if (A.dates[0] == updated.dates[0] &&
-                                A.task == updated.task) {
-                                A.category = updated.category;
-                            }
-                        }
-                    } else {
-                        // completed
-                        Task &updated = completedTasks[realIndex];
-                        for (auto &A : allTasks) {
-                            if (A.dates[0] == updated.dates[0] &&
-                                A.task == updated.task) {
-                                A.category = updated.category;
-                            }
-                        }
-                    }
-                    needRedraw = true;
-                }
-            } break;
-
+            case 's':
+                addCategoryOverlay();
+                needRedraw = true;
+                break;
             case '#':
                 listCategoriesOverlay();
                 needRedraw = true;
                 break;
-
             case 'e':
-                editTask();
+                editTaskUI();
                 needRedraw = true;
                 break;
-
             case ':': {
                 mvprintw(LINES - 1, 0, "Goto item (blank=cancel): ");
                 clrtoeol();
-                wnoutrefresh(stdscr);
-                doupdate();
                 echo();
                 curs_set(1);
-
                 char buffer[16];
                 memset(buffer, 0, sizeof(buffer));
                 wgetnstr(stdscr, buffer, 15);
-
                 noecho();
                 curs_set(0);
-
                 std::string lineInput(buffer);
                 if (!lineInput.empty()) {
-                    try {
-                        int itemNum = std::stoi(lineInput);
-                        gotoItem(itemNum);
-                        needRedraw = true;
-                    } catch (...) {
-                        // ignore invalid input
-                    }
+                    try { gotoItem(std::stoi(lineInput)); needRedraw = true; } catch (...) {}
                 }
                 mvprintw(LINES - 1, 0, "                                              ");
                 clrtoeol();
-                wnoutrefresh(stdscr);
-                doupdate();
             } break;
-
             case '\t':
                 viewMode = 1 - viewMode;
                 selectedIndex = 0;
                 needRedraw = true;
                 break;
-
             default:
                 break;
         }
-
-        if (needRedraw) {
-            drawUI();
-            doupdate();
-        }
+        if (needRedraw) { drawUI(); }
     }
-
     delwin(listWin);
     endwin();
     return 0;

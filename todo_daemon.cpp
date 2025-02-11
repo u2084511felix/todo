@@ -1,111 +1,96 @@
+// daemon.cpp
 #include <iostream>
-#include <fstream>
 #include <sstream>
 #include <vector>
 #include <string>
 #include <chrono>
 #include <thread>
-#include <cstdlib>    // for system()
-#include <ctime>      // for time()
+#include <cstdlib>
+#include <ctime>
+#include <sqlite3.h>
 
+static const std::string DB_PATH = "/var/lib/todo/todosql.db";
 
-// TODO: inotify + epoll. Waits for file modification.
-
-// Path to the file storing scheduled notifications.
-// Make sure your service has permission to read/write this file.
-
-static const std::string NOTIFICATION_FILE = "/var/lib/todo/notifications.db";
-// A simple struct to hold notification data
+// Extend the Notification struct to include an ID.
 struct Notification {
-    long long scheduledTime; // epoch timestamp when to trigger
-    bool triggered;          // has the notification been sent?
-    std::string message;     // the notification text
+    int id;
+    long long scheduledTime;
+    int triggered;
+    std::string message;
 };
 
-// Helper function to load all notifications from file
-std::vector<Notification> loadNotifications() {
-    std::vector<Notification> notifs;
-    std::ifstream inFile(NOTIFICATION_FILE);
-    if (!inFile.is_open()) {
-        // If file can't be opened, return empty vector
-        return notifs;
+// Initialize the database (ensure the notifications table exists).
+void initDB() {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) {
+        std::cerr << "Can't open DB: " << sqlite3_errmsg(db) << "\n";
+        return;
     }
+    const char* sql =
+        "CREATE TABLE IF NOT EXISTS notifications ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "scheduled_time INTEGER NOT NULL, "
+        "triggered INTEGER NOT NULL, "
+        "message TEXT"
+        ");";
+    char* errMsg = nullptr;
+    if (sqlite3_exec(db, sql, nullptr, nullptr, &errMsg) != SQLITE_OK) {
+        std::cerr << "Error creating notifications table: " << errMsg << "\n";
+        sqlite3_free(errMsg);
+    }
+    sqlite3_close(db);
+}
 
-    std::string line;
-    while (std::getline(inFile, line)) {
-        if (line.empty()) continue;
-        std::stringstream ss(line);
-        std::string part;
-
+// Fetch pending notifications (those not yet triggered and whose scheduled time has passed).
+std::vector<Notification> fetchPendingNotifications() {
+    std::vector<Notification> notifs;
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) return notifs;
+    const char* sql = "SELECT id, scheduled_time, triggered, message FROM notifications WHERE triggered = 0 AND scheduled_time <= ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) { sqlite3_close(db); return notifs; }
+    long long now = std::time(nullptr);
+    sqlite3_bind_int64(stmt, 1, now);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
         Notification n;
-        // Format: epoch_timestamp;triggered_flag;message
-        if (std::getline(ss, part, ';')) {
-            n.scheduledTime = std::stoll(part);
-        }
-        if (std::getline(ss, part, ';')) {
-            n.triggered = (part == "1");
-        }
-        if (std::getline(ss, part)) {
-            n.message = part;
-        }
+        n.id = sqlite3_column_int(stmt, 0);
+        n.scheduledTime = sqlite3_column_int64(stmt, 1);
+        n.triggered = sqlite3_column_int(stmt, 2);
+        n.message = (const char*)sqlite3_column_text(stmt, 3);
         notifs.push_back(n);
     }
-    inFile.close();
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
     return notifs;
 }
 
-// Helper function to save all notifications back to file
-void saveNotifications(const std::vector<Notification>& notifs) {
-    std::ofstream outFile(NOTIFICATION_FILE, std::ios::trunc); // overwrite
-    if (!outFile.is_open()) {
-        std::cerr << "ERROR: Unable to write to " << NOTIFICATION_FILE << std::endl;
-        return;
-    }
-    for (auto &n : notifs) {
-        outFile << n.scheduledTime << ";"
-                << (n.triggered ? "1" : "0") << ";"
-                << n.message << "\n";
-    }
-    outFile.close();
+// Mark a notification as triggered.
+bool updateNotificationTriggered(int notifId) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) return false;
+    const char* sql = "UPDATE notifications SET triggered = 1 WHERE id = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) { sqlite3_close(db); return false; }
+    sqlite3_bind_int(stmt, 1, notifId);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return (rc == SQLITE_DONE);
 }
 
 int main() {
-    std::cout << "my_daemon started. Monitoring scheduled notifications...\n";
-
-    // Create the file if it doesn't exist (so we can open it without errors)
-    {
-        std::ofstream createFile(NOTIFICATION_FILE, std::ios::app);
-        // Just ensure file exists. Do nothing else.
-    }
-
+    std::cout << "Notification daemon started. Monitoring scheduled notifications...\n";
+    initDB();
     while (true) {
-        // Load notifications
-        auto notifs = loadNotifications();
-
-        // Current epoch time
-        auto now = static_cast<long long>(std::time(nullptr));
-        bool updated = false;
-
-        // Check each notification
+        auto notifs = fetchPendingNotifications();
         for (auto &n : notifs) {
-            // If not triggered and time has come
-            if (!n.triggered && (n.scheduledTime <= now && n.scheduledTime > (now - 2))) {
-                // Send the notification (using notify-send)
-                std::string command = "notify-send '~@~TODO!~@~' '" + n.message + "'";
-                system(command.c_str());
-                n.triggered = true;
-                updated = true;
-            }
+            // Use a system command (e.g., notify-send) to show the notification.
+            std::string command = "notify-send 'TODO!' '" + n.message + "'";
+            system(command.c_str());
+            updateNotificationTriggered(n.id);
         }
-
-        // If we triggered any new notifications, save them
-        if (updated) {
-            saveNotifications(notifs);
-        }
-
-        // Sleep some seconds before checking again
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-
     return 0;
 }
+
