@@ -64,10 +64,16 @@ Refer to the [Dependencies Installation](#dependencies-installation) section bel
 
 ---
 
-## Notes
+## TODO:
 
-- Make sure to use absolute path in the symlink. 
-- Feel free to fork this repo and make pull requests. Just make sure to do git assume-unchanged on your current and completed files.
+- Resolve flicker when navigating list in SQL version
+
+---
+
+
+## Contribution
+
+- Feel free to fork this repo and make pull requests. 
 
 ---
 
