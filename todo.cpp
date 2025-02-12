@@ -353,7 +353,7 @@ int drawTaskLine(int idx, int startY, bool highlight) {
 // --------------------------------------------------------------------
 void drawListUIFull() {
     werase(listWin);
-    wbkgd(listWin, COLOR_PAIR(4));
+    wbkgd(listWin, COLOR_PAIR(1));
     box(listWin, 0, 0);
     
     int maxX = getmaxx(listWin);
@@ -712,14 +712,19 @@ int main() {
         std::cerr << "Your terminal does not support color." << std::endl;
         return 1;
     }
+
     start_color();
-    init_pair(1, COLOR_BLUE, COLOR_WHITE);
-    init_pair(2, COLOR_WHITE, COLOR_BLACK);
-    init_pair(3, COLOR_BLUE, COLOR_WHITE);
-    init_pair(4, COLOR_BLUE, COLOR_WHITE);
-    
-    bkgd(COLOR_PAIR(4));
-    wbkgd(stdscr, COLOR_PAIR(4));
+    use_default_colors();  // Enable full transparency (inherits terminal text & bg)
+
+    // Use -1 for both text and background (terminal default)
+    init_pair(1, -1, -1); // Default terminal text on default terminal background
+    init_pair(2, COLOR_CYAN, -1);  // Cyan text, terminal default background
+    init_pair(3, COLOR_YELLOW, -1); // Yellow text, terminal default background
+
+    // Apply default color to the entire screen
+    bkgd(COLOR_PAIR(1));
+    wbkgd(stdscr, COLOR_PAIR(1));
+
     refresh();
     
     int listStartY = 8, listStartX = 2;
